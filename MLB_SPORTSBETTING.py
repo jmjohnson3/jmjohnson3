@@ -493,22 +493,55 @@ def train_and_predict_games_ensemble(
     """
     X_today = X_today[X.columns]
 
-    # 1) Fit GLM pipelines
+    # Drop constant features that provide no information
+    bad_cols = [c for c in X.columns if X[c].nunique() <= 1]
+    if bad_cols:
+        X = X.drop(columns=bad_cols)
+        X_today = X_today.drop(columns=bad_cols, errors='ignore')
+
+    # Treat team identifiers as categorical for LightGBM but remove from GLM
+    cat_cols = [c for c in ['away_team_id', 'home_team_id'] if c in X.columns]
+    for df in (X, X_today):
+        for c in cat_cols:
+            df[c] = df[c].astype('category')
+
+    cat_idx = [X.columns.get_loc(c) for c in cat_cols]
+
+    # Split feature sets: trees get full X, GLM drops team-id columns
+    X_glm = X.drop(columns=cat_cols)
+    X_glm_today = X_today.drop(columns=cat_cols, errors='ignore')
+
+    # 1) Fit GLM pipelines on numeric features only
     glm_away = Pipeline([('scaler', StandardScaler()), ('model', PoissonRegressor(alpha=0.0, max_iter=2000))])
     glm_home = Pipeline([('scaler', StandardScaler()), ('model', PoissonRegressor(alpha=0.0, max_iter=2000))])
-    glm_away.fit(X, y['away_score']); glm_home.fit(X, y['home_score'])
+    glm_away.fit(X_glm, y['away_score']); glm_home.fit(X_glm, y['home_score'])
 
-    # 2) Fit GBMs
-    gbm_away = lgb.LGBMRegressor(objective='poisson', n_estimators=300, learning_rate=0.05)
-    gbm_home = lgb.LGBMRegressor(objective='poisson', n_estimators=300, learning_rate=0.05)
-    gbm_away.fit(X, y['away_score']); gbm_home.fit(X, y['home_score'])
+    # 2) Fit GBMs with categorical team identifiers
+    gbm_away = lgb.LGBMRegressor(
+        objective='poisson', n_estimators=300, learning_rate=0.05,
+        categorical_feature=cat_idx
+    )
+    gbm_home = lgb.LGBMRegressor(
+        objective='poisson', n_estimators=300, learning_rate=0.05,
+        categorical_feature=cat_idx
+    )
+    gbm_away.fit(X, y['away_score'], categorical_feature=cat_idx)
+    gbm_home.fit(X, y['home_score'], categorical_feature=cat_idx)
 
     # 3) Cross-validate
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    cv_glm_away = -cross_val_score(glm_away.named_steps['model'], X, y['away_score'], cv=kf, scoring='neg_mean_poisson_deviance')
-    cv_gbm_away = -cross_val_score(gbm_away, X, y['away_score'], cv=kf, scoring='neg_mean_poisson_deviance')
-    cv_glm_home = -cross_val_score(glm_home.named_steps['model'], X, y['home_score'], cv=kf, scoring='neg_mean_poisson_deviance')
-    cv_gbm_home = -cross_val_score(gbm_home, X, y['home_score'], cv=kf, scoring='neg_mean_poisson_deviance')
+    cv_glm_away = -cross_val_score(
+        glm_away, X_glm, y['away_score'], cv=kf, scoring='neg_mean_poisson_deviance'
+    )
+    cv_gbm_away = -cross_val_score(
+        gbm_away, X, y['away_score'], cv=kf, scoring='neg_mean_poisson_deviance'
+    )
+    cv_glm_home = -cross_val_score(
+        glm_home, X_glm, y['home_score'], cv=kf, scoring='neg_mean_poisson_deviance'
+    )
+    cv_gbm_home = -cross_val_score(
+        gbm_home, X, y['home_score'], cv=kf, scoring='neg_mean_poisson_deviance'
+    )
 
     # 4) Compute weights and raw lambdas
     w_glm_away = cv_gbm_away.mean() / (cv_glm_away.mean() + cv_gbm_away.mean())
@@ -516,13 +549,14 @@ def train_and_predict_games_ensemble(
     w_glm_home = cv_gbm_home.mean() / (cv_glm_home.mean() + cv_gbm_home.mean())
     w_gbm_home = cv_glm_home.mean() / (cv_glm_home.mean() + cv_gbm_home.mean())
 
-    lam_away_glm   = glm_away.predict(X_today)
+    # PoissonRegressor outputs log-lambda; exponentiate to get expected runs
+    lam_away_glm   = np.exp(glm_away.predict(X_glm_today))
     lam_away_gbm   = gbm_away.predict(X_today)
-    lam_home_glm   = glm_home.predict(X_today)
+    lam_home_glm   = np.exp(glm_home.predict(X_glm_today))
     lam_home_gbm   = gbm_home.predict(X_today)
-    lam_away_glm_tr = glm_away.predict(X)
+    lam_away_glm_tr = np.exp(glm_away.predict(X_glm))
     lam_away_gbm_tr = gbm_away.predict(X)
-    lam_home_glm_tr = glm_home.predict(X)
+    lam_home_glm_tr = np.exp(glm_home.predict(X_glm))
     lam_home_gbm_tr = gbm_home.predict(X)
 
     # 5) Ensemble
@@ -530,6 +564,10 @@ def train_and_predict_games_ensemble(
     lam_home_tr = w_glm_home * lam_home_glm_tr + w_gbm_home * lam_home_gbm_tr
     lam_away   = w_glm_away * lam_away_glm   + w_gbm_away * lam_away_gbm
     lam_home   = w_glm_home * lam_home_glm   + w_gbm_home * lam_home_gbm
+
+    # clip extreme lambdas that destabilize calibration
+    for arr in (lam_away_tr, lam_home_tr, lam_away, lam_home):
+        np.clip(arr, 0, 20, out=arr)
 
     # 6) Calibration via training lambdas
     mean_away = y['away_score'].mean(); mean_home = y['home_score'].mean()
