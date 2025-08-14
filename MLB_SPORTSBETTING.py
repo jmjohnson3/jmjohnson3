@@ -499,11 +499,13 @@ def train_and_predict_games_ensemble(
         X = X.drop(columns=bad_cols)
         X_today = X_today.drop(columns=bad_cols, errors='ignore')
 
+
     # Treat team identifiers as categorical for LightGBM but remove from GLM
     cat_cols = [c for c in ['away_team_id', 'home_team_id'] if c in X.columns]
     for df in (X, X_today):
         for c in cat_cols:
             df[c] = df[c].astype('category')
+
 
     cat_idx = [X.columns.get_loc(c) for c in cat_cols]
 
@@ -515,6 +517,7 @@ def train_and_predict_games_ensemble(
     glm_away = Pipeline([('scaler', StandardScaler()), ('model', PoissonRegressor(alpha=0.0, max_iter=2000))])
     glm_home = Pipeline([('scaler', StandardScaler()), ('model', PoissonRegressor(alpha=0.0, max_iter=2000))])
     glm_away.fit(X_glm, y['away_score']); glm_home.fit(X_glm, y['home_score'])
+
 
     # 2) Fit GBMs with categorical team identifiers
     gbm_away = lgb.LGBMRegressor(
@@ -550,6 +553,7 @@ def train_and_predict_games_ensemble(
     w_gbm_home = cv_glm_home.mean() / (cv_glm_home.mean() + cv_gbm_home.mean())
 
     # PoissonRegressor outputs log-lambda; exponentiate to get expected runs
+
     lam_away_glm   = np.exp(glm_away.predict(X_glm_today))
     lam_away_gbm   = gbm_away.predict(X_today)
     lam_home_glm   = np.exp(glm_home.predict(X_glm_today))
