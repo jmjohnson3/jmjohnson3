@@ -511,21 +511,31 @@ def train_and_predict_games_ensemble(
     glm_away.fit(X, y['away_score']); glm_home.fit(X, y['home_score'])
 
     # 2) Fit GBMs
-    gbm_away = lgb.LGBMRegressor(objective='poisson', n_estimators=300, learning_rate=0.05)
-    gbm_home = lgb.LGBMRegressor(objective='poisson', n_estimators=300, learning_rate=0.05)
-    gbm_away.fit(X, y['away_score'], categorical_feature=cat_cols)
-    gbm_home.fit(X, y['home_score'], categorical_feature=cat_cols)
+    gbm_away = lgb.LGBMRegressor(
+        objective='poisson', n_estimators=300, learning_rate=0.05,
+        categorical_feature=cat_cols
+    )
+    gbm_home = lgb.LGBMRegressor(
+        objective='poisson', n_estimators=300, learning_rate=0.05,
+        categorical_feature=cat_cols
+    )
+    gbm_away.fit(X, y['away_score'])
+    gbm_home.fit(X, y['home_score'])
 
     # 3) Cross-validate
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    cv_glm_away = -cross_val_score(glm_away.named_steps['model'], X, y['away_score'], cv=kf, scoring='neg_mean_poisson_deviance')
-    cv_gbm_away = -cross_val_score(gbm_away, X, y['away_score'], cv=kf,
-                                   scoring='neg_mean_poisson_deviance',
-                                   fit_params={'categorical_feature': cat_cols})
-    cv_glm_home = -cross_val_score(glm_home.named_steps['model'], X, y['home_score'], cv=kf, scoring='neg_mean_poisson_deviance')
-    cv_gbm_home = -cross_val_score(gbm_home, X, y['home_score'], cv=kf,
-                                   scoring='neg_mean_poisson_deviance',
-                                   fit_params={'categorical_feature': cat_cols})
+    cv_glm_away = -cross_val_score(
+        glm_away, X, y['away_score'], cv=kf, scoring='neg_mean_poisson_deviance'
+    )
+    cv_gbm_away = -cross_val_score(
+        gbm_away, X, y['away_score'], cv=kf, scoring='neg_mean_poisson_deviance'
+    )
+    cv_glm_home = -cross_val_score(
+        glm_home, X, y['home_score'], cv=kf, scoring='neg_mean_poisson_deviance'
+    )
+    cv_gbm_home = -cross_val_score(
+        gbm_home, X, y['home_score'], cv=kf, scoring='neg_mean_poisson_deviance'
+    )
 
     # 4) Compute weights and raw lambdas
     w_glm_away = cv_gbm_away.mean() / (cv_glm_away.mean() + cv_gbm_away.mean())
