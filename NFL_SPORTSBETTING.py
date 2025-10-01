@@ -1000,22 +1000,63 @@ class ModelTrainer:
             "position",
         ]
 
-        X = df[numeric_features + categorical_features]
+        available_numeric = [
+            col for col in numeric_features if col in df.columns and df[col].notna().any()
+        ]
+        dropped_numeric = sorted(set(numeric_features) - set(available_numeric))
+        if dropped_numeric:
+            logging.debug(
+                "Dropping numeric features with no observed values for %s model: %s",
+                target,
+                ", ".join(dropped_numeric),
+            )
+
+        available_categorical = [
+            col for col in categorical_features if col in df.columns and df[col].notna().any()
+        ]
+        dropped_categorical = sorted(set(categorical_features) - set(available_categorical))
+        if dropped_categorical:
+            logging.debug(
+                "Dropping categorical features with no observed values for %s model: %s",
+                target,
+                ", ".join(dropped_categorical),
+            )
+
+        if not available_numeric and not available_categorical:
+            logging.warning(
+                "No usable features with observed values available to train %s model; skipping.",
+                target,
+            )
+            return None
+
+        feature_columns = available_numeric + available_categorical
+        X = df[feature_columns]
         y = df[target]
 
-        preprocessor = ColumnTransformer(
-            transformers=[
-                ("num", Pipeline([("imputer", SimpleImputer()), ("scaler", StandardScaler())]), numeric_features),
+        transformers = []
+        if available_numeric:
+            transformers.append(
+                (
+                    "num",
+                    Pipeline([("imputer", SimpleImputer()), ("scaler", StandardScaler())]),
+                    available_numeric,
+                )
+            )
+        if available_categorical:
+            transformers.append(
+
                 (
                     "cat",
                     Pipeline([
                         ("imputer", SimpleImputer(strategy="most_frequent")),
                         ("onehot", OneHotEncoder(handle_unknown="ignore")),
                     ]),
-                    categorical_features,
-                ),
-            ]
-        )
+                    available_categorical,
+                )
+            )
+
+        preprocessor = ColumnTransformer(transformers=transformers)
+
 
         model = Pipeline([
             ("preprocessor", preprocessor),
@@ -1054,24 +1095,63 @@ class ModelTrainer:
         ]
         categorical_features = ["venue", "day_of_week", "referee", "home_team", "away_team"]
 
-        X = df[numeric_features + categorical_features]
+        available_numeric = [
+            col for col in numeric_features if col in df.columns and df[col].notna().any()
+        ]
+        dropped_numeric = sorted(set(numeric_features) - set(available_numeric))
+        if dropped_numeric:
+            logging.debug(
+                "Dropping numeric game features with no observed values: %s",
+                ", ".join(dropped_numeric),
+            )
+
+        available_categorical = [
+            col for col in categorical_features if col in df.columns and df[col].notna().any()
+        ]
+        dropped_categorical = sorted(set(categorical_features) - set(available_categorical))
+        if dropped_categorical:
+            logging.debug(
+                "Dropping categorical game features with no observed values: %s",
+                ", ".join(dropped_categorical),
+            )
+
+        if not available_numeric and not available_categorical:
+            logging.warning(
+                "No usable features with observed values available to train game-level models.",
+            )
+            return {}
+
+        feature_columns = available_numeric + available_categorical
+
+        X = df[feature_columns]
+
         y_winner = (df["game_result"] == "home").astype(int)
         y_home_score = df["home_score"]
         y_away_score = df["away_score"]
 
-        preprocessor = ColumnTransformer(
-            transformers=[
-                ("num", Pipeline([("imputer", SimpleImputer()), ("scaler", StandardScaler())]), numeric_features),
+        transformers = []
+        if available_numeric:
+            transformers.append(
+                (
+                    "num",
+                    Pipeline([("imputer", SimpleImputer()), ("scaler", StandardScaler())]),
+                    available_numeric,
+                )
+            )
+        if available_categorical:
+            transformers.append(
+
                 (
                     "cat",
                     Pipeline([
                         ("imputer", SimpleImputer(strategy="most_frequent")),
                         ("onehot", OneHotEncoder(handle_unknown="ignore")),
                     ]),
-                    categorical_features,
-                ),
-            ]
-        )
+                    available_categorical,
+                )
+            )
+
+        preprocessor = ColumnTransformer(transformers=transformers)
 
         clf = Pipeline([
             ("preprocessor", preprocessor),
