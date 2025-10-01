@@ -309,6 +309,12 @@ class NFLIngestor:
         for season in seasons:
             games = self.msf_client.fetch_games(season)
             logging.info("Fetched %d games for season %s", len(games), season)
+            if not games:
+                logging.warning(
+                    "No games returned from MySportsFeeds for %s. "
+                    "Verify your API credentials, plan access, and season configuration.",
+                    season,
+                )
 
             new_game_rows: List[Dict[str, Any]] = []
             player_rows: List[Dict[str, Any]] = []
@@ -387,6 +393,15 @@ class NFLIngestor:
 
             self.db.upsert_rows(self.db.games, new_game_rows, ["game_id"])
             self.db.upsert_rows(self.db.player_stats, player_rows, ["game_id", "player_id"])
+            if len(new_game_rows) == 0 and len(player_rows) == 0:
+                logging.warning(
+                    "Ingested %d new games and %d player stat rows for %s. "
+                    "If these counts are unexpectedly low, confirm that your MySportsFeeds subscription "
+                    "includes detailed stats and that the targeted seasons contain completed games.",
+                    len(new_game_rows),
+                    len(player_rows),
+                    season,
+                )
 
         # Ingest odds separately as they change frequently (always upsert)
         self._ingest_odds()
@@ -944,8 +959,26 @@ def main() -> None:
     ingestor.ingest(config.seasons)
 
     trainer = ModelTrainer(engine)
-    models = trainer.train()
+    try:
+        models = trainer.train()
+    except RuntimeError as exc:
+        logging.error("Unable to train models: %s", exc)
+        logging.error(
+            "Model training requires historical games and player statistics. "
+            "Ensure ingestion succeeded (check API credentials, plan access, and season settings) before rerunning."
+        )
+        if args.predict:
+            logging.error("Prediction generation skipped because models were not trained.")
+        return
 
+    if not models:
+        logging.warning(
+            "No models were trained. Verify that sufficient labeled data exists in the database before requesting predictions."
+        )
+        if args.predict:
+            logging.error("Prediction generation skipped because no models were available.")
+        return
+    models = trainer.train()
     if args.predict:
         predict_upcoming_games(models, engine, args.output)
 
