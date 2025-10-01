@@ -399,6 +399,7 @@ class NFLIngestor:
                 game_id_str = str(game_id)
                 have_player_stats = game_id_str in games_with_stats
                 score = game.get("score") or {}
+                home_score, away_score = self._extract_score_totals(score)
                 start_time = parse_dt(schedule.get("startTime"))
                 venue = schedule.get("venue") or {}
                 weather = schedule.get("weather") or {}
@@ -430,13 +431,19 @@ class NFLIngestor:
                         "weather_conditions": weather.get("conditions"),
                         "home_team": schedule.get("homeTeam", {}).get("abbreviation"),
                         "away_team": schedule.get("awayTeam", {}).get("abbreviation"),
-                        "home_score": score.get("homeScore"),
-                        "away_score": score.get("awayScore"),
+                        "home_score": home_score,
+                        "away_score": away_score,
                         "status": schedule.get("status"),
                     }
                 )
 
-                status = (schedule.get("status") or "").lower()
+                status = (
+                    schedule.get("status")
+                    or schedule.get("playedStatus")
+                    or (game.get("status") if isinstance(game, dict) else None)
+                    or ""
+                ).lower()
+
                 is_completed = status.startswith("final") or status in {"completed", "postponed"}
 
                 if have_player_stats:
@@ -627,6 +634,49 @@ class NFLIngestor:
             year -= 1
         return f"{year}-regular"
 
+    @staticmethod
+    def _extract_score_totals(score_payload: Any) -> Tuple[Optional[float], Optional[float]]:
+        """Extract final home and away scores from the flexible MSF schedule payload."""
+
+        if not isinstance(score_payload, dict):
+            return None, None
+
+        def first_numeric(mapping: Dict[str, Any], candidates: Tuple[str, ...]) -> Optional[float]:
+            for key in candidates:
+                if key not in mapping or mapping[key] in (None, ""):
+                    continue
+                value = mapping[key]
+                if isinstance(value, dict):
+                    for inner_key in ("#text", "value", "total", "score", "amount"):
+                        inner_val = value.get(inner_key)
+                        parsed = NFLIngestor._safe_float(inner_val)
+                        if parsed is not None:
+                            return parsed
+                    parsed = NFLIngestor._safe_float(value)
+                    if parsed is not None:
+                        return parsed
+                else:
+                    parsed = NFLIngestor._safe_float(value)
+                    if parsed is not None:
+                        return parsed
+            return None
+
+        home_candidates = (
+            "homeScore",
+            "homeScoreTotal",
+            "homeScoreFinal",
+            "homePoints",
+            "homeScoreValue",
+        )
+        away_candidates = (
+            "awayScore",
+            "awayScoreTotal",
+            "awayScoreFinal",
+            "awayPoints",
+            "awayScoreValue",
+        )
+
+        return first_numeric(score_payload, home_candidates), first_numeric(score_payload, away_candidates)
 
 # ---------------------------------------------------------------------------
 # Feature engineering & modeling
