@@ -398,7 +398,6 @@ class NFLIngestor:
 
                 game_id_str = str(game_id)
                 have_player_stats = game_id_str in games_with_stats
-
                 score = game.get("score") or {}
                 start_time = parse_dt(schedule.get("startTime"))
                 venue = schedule.get("venue") or {}
