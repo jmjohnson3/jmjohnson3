@@ -226,6 +226,14 @@ class NFLDatabase:
             rows = conn.execute(select(self.games.c.game_id)).fetchall()
         return {row[0] for row in rows}
 
+    def fetch_games_with_player_stats(self) -> set[str]:
+        """Return the set of game IDs that already have player statistics stored."""
+
+        with self.engine.begin() as conn:
+            rows = conn.execute(select(self.player_stats.c.game_id).distinct()).fetchall()
+        return {row[0] for row in rows}
+
+
     def latest_team_rating_week(self, season: str) -> Optional[int]:
         with self.engine.begin() as conn:
             row = conn.execute(
@@ -345,6 +353,8 @@ class NFLIngestor:
 
     def ingest(self, seasons: Iterable[str]) -> None:
         existing_games = self.db.fetch_existing_game_ids()
+        games_with_stats = self.db.fetch_games_with_player_stats()
+
         logging.info("Found %d games already in database", len(existing_games))
 
         for season in seasons:
@@ -365,9 +375,10 @@ class NFLIngestor:
                 game_id = schedule.get("id")
                 if not game_id:
                     continue
-                if game_id in existing_games:
-                    logging.debug("Skipping already ingested game %s", game_id)
-                    continue
+
+                game_id_str = str(game_id)
+                have_player_stats = game_id_str in games_with_stats
+
 
                 score = game.get("score") or {}
                 start_time = parse_dt(schedule.get("startTime"))
@@ -386,7 +397,7 @@ class NFLIngestor:
 
                 new_game_rows.append(
                     {
-                        "game_id": str(game_id),
+                        "game_id": game_id_str,
                         "season": season,
                         "week": schedule.get("week"),
                         "start_time": start_time,
@@ -407,7 +418,30 @@ class NFLIngestor:
                     }
                 )
 
-                gamelog_entries = self.msf_client.fetch_player_gamelogs(season, str(game_id))
+                status = (schedule.get("status") or "").lower()
+                is_completed = status.startswith("final") or status in {"completed", "postponed"}
+
+                if have_player_stats:
+                    logging.debug(
+                        "Skipping player stats for already ingested game %s", game_id_str
+                    )
+                    continue
+
+                if not is_completed:
+                    logging.debug(
+                        "Game %s in season %s has status '%s'; skipping player stats fetch until completion",
+                        game_id_str,
+                        season,
+                        schedule.get("status"),
+                    )
+                    continue
+
+                gamelog_entries = self.msf_client.fetch_player_gamelogs(season, game_id_str)
+                if not gamelog_entries:
+                    logging.debug(
+                        "No player gamelog entries returned for season %s game %s", season, game_id_str
+                    )
+
                 for entry in gamelog_entries:
                     player = entry.get("player", {})
                     team = entry.get("team", {})
@@ -420,7 +454,7 @@ class NFLIngestor:
 
                     player_rows.append(
                         {
-                            "game_id": str(game_id),
+                            "game_id": game_id_str,
                             "player_id": str(player.get("id")),
                             "player_name": f"{player.get('firstName', '')} {player.get('lastName', '')}".strip(),
                             "team": team.get("abbreviation"),
