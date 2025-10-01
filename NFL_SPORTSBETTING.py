@@ -398,7 +398,6 @@ class NFLIngestor:
 
                 game_id_str = str(game_id)
                 have_player_stats = game_id_str in games_with_stats
-
                 score = game.get("score") or {}
                 home_score, away_score = self._extract_score_totals(score)
                 start_time = parse_dt(schedule.get("startTime"))
@@ -444,6 +443,7 @@ class NFLIngestor:
                     or (game.get("status") if isinstance(game, dict) else None)
                     or ""
                 ).lower()
+
                 is_completed = status.startswith("final") or status in {"completed", "postponed"}
 
                 if have_player_stats:
@@ -677,7 +677,6 @@ class NFLIngestor:
         )
 
         return first_numeric(score_payload, home_candidates), first_numeric(score_payload, away_candidates)
-
 
 # ---------------------------------------------------------------------------
 # Feature engineering & modeling
