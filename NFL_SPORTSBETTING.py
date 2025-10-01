@@ -443,7 +443,6 @@ class NFLIngestor:
                     or (game.get("status") if isinstance(game, dict) else None)
                     or ""
                 ).lower()
-
                 is_completed = status.startswith("final") or status in {"completed", "postponed"}
 
                 if have_player_stats:
@@ -693,6 +692,15 @@ class FeatureBuilder:
         games = pd.read_sql_table("nfl_games", self.engine)
         player_stats = pd.read_sql_table("nfl_player_stats", self.engine)
         team_ratings = pd.read_sql_table("nfl_team_unit_ratings", self.engine)
+
+        # Some SQLAlchemy engines (notably PostgreSQL) return column names as
+        # ``quoted_name`` objects, which scikit-learn refuses to accept when
+        # validating feature names. Normalize them to plain strings up-front so
+        # downstream selectors and pipelines see consistent column labels.
+        games = games.rename(columns=lambda col: str(col))
+        player_stats = player_stats.rename(columns=lambda col: str(col))
+        team_ratings = team_ratings.rename(columns=lambda col: str(col))
+
         return games, player_stats, team_ratings
 
     def build_features(self) -> Dict[str, pd.DataFrame]:
