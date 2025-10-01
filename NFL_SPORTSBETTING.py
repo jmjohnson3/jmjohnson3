@@ -27,6 +27,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import requests
+from requests import HTTPError
+
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.impute import SimpleImputer
@@ -287,10 +289,21 @@ class MySportsFeedsClient:
         return self._request(f"{season}/games/{game_id}/boxscore.json")
 
     def fetch_player_gamelogs(self, season: str, game_id: str) -> List[Dict[str, Any]]:
-        data = self._request(
-            f"{season}/games/{game_id}/player_gamelogs.json",
-            params={"stats": "Rushing,Receiving,Passing,Fumbles"},
-        )
+        try:
+            data = self._request(
+                f"{season}/games/{game_id}/player_gamelogs.json",
+                params={"stats": "Rushing,Receiving,Passing,Fumbles"},
+            )
+        except HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 404:
+                logging.debug(
+                    "No player gamelogs found for season %s game %s (HTTP 404)",
+                    season,
+                    game_id,
+                )
+                return []
+            raise
         return data.get("gamelogs", [])
 
 
