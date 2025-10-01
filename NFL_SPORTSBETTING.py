@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 import requests
 from requests import HTTPError
+
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.impute import SimpleImputer
@@ -1020,6 +1021,7 @@ def main() -> None:
             logging.error("Prediction generation skipped because no models were available.")
         return
 
+    models = trainer.train()
     if args.predict:
         predict_upcoming_games(models, engine, args.output)
 
