@@ -461,11 +461,22 @@ class NFLIngestor:
                     continue
 
                 gamelog_entries = self.msf_client.fetch_player_gamelogs(season, game_id_str)
-                if not gamelog_entries:
+                player_entries = list(gamelog_entries)
+                if not player_entries:
                     logging.debug(
                         "No player gamelog entries returned for season %s game %s", season, game_id_str
                     )
-                for entry in gamelog_entries:
+                    fallback_entries = self._fetch_boxscore_player_stats(season, game_id_str)
+                    if fallback_entries:
+                        logging.debug(
+                            "Using boxscore fallback for season %s game %s player stats",
+                            season,
+                            game_id_str,
+                        )
+                        player_entries = fallback_entries
+                if not player_entries:
+                    continue
+                for entry in player_entries:
                     player = entry.get("player", {})
                     team = entry.get("team", {})
                     stats = entry.get("stats", {})
@@ -633,6 +644,42 @@ class NFLIngestor:
             year -= 1
         return f"{year}-regular"
 
+    def _fetch_boxscore_player_stats(self, season: str, game_id: str) -> List[Dict[str, Any]]:
+        """Fallback to boxscore endpoint when detailed gamelogs are unavailable."""
+
+        try:
+            boxscore = self.msf_client.fetch_game_boxscore(season, game_id)
+        except HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 404:
+                logging.debug(
+                    "Boxscore not available for season %s game %s (HTTP 404)",
+                    season,
+                    game_id,
+                )
+                return []
+            logging.debug(
+                "Failed to fetch boxscore for season %s game %s: %s",
+                season,
+                game_id,
+                exc,
+            )
+            return []
+
+        totals = boxscore.get("playerStatsTotals") or []
+        normalized: List[Dict[str, Any]] = []
+        for total in totals:
+            if not isinstance(total, dict):
+                continue
+            normalized.append(
+                {
+                    "player": total.get("player", {}) or {},
+                    "team": total.get("team", {}) or {},
+                    "stats": total.get("stats", {}) or {},
+                }
+            )
+        return normalized
+
     @staticmethod
     def _extract_score_totals(score_payload: Any) -> Tuple[Optional[float], Optional[float]]:
         """Extract final home and away scores from the flexible MSF schedule payload."""
@@ -676,7 +723,6 @@ class NFLIngestor:
         )
 
         return first_numeric(score_payload, home_candidates), first_numeric(score_payload, away_candidates)
-
 # ---------------------------------------------------------------------------
 # Feature engineering & modeling
 # ---------------------------------------------------------------------------
@@ -700,7 +746,6 @@ class FeatureBuilder:
         games = games.rename(columns=lambda col: str(col))
         player_stats = player_stats.rename(columns=lambda col: str(col))
         team_ratings = team_ratings.rename(columns=lambda col: str(col))
-
         return games, player_stats, team_ratings
 
     def build_features(self) -> Dict[str, pd.DataFrame]:
@@ -1058,8 +1103,6 @@ class ModelTrainer:
             )
 
         preprocessor = ColumnTransformer(transformers=transformers)
-
-
         model = Pipeline([
             ("preprocessor", preprocessor),
             ("regressor", GradientBoostingRegressor(random_state=42)),
@@ -1126,7 +1169,6 @@ class ModelTrainer:
         feature_columns = available_numeric + available_categorical
 
         X = df[feature_columns]
-
         y_winner = (df["game_result"] == "home").astype(int)
         y_home_score = df["home_score"]
         y_away_score = df["away_score"]
@@ -1149,7 +1191,6 @@ class ModelTrainer:
                             "imputer",
                             SimpleImputer(strategy="constant", fill_value="missing"),
                         ),
-
                         ("onehot", OneHotEncoder(handle_unknown="ignore")),
                     ]),
                     available_categorical,
