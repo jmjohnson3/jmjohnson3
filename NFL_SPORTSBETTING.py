@@ -233,6 +233,7 @@ class NFLDatabase:
             rows = conn.execute(select(self.player_stats.c.game_id).distinct()).fetchall()
         return {row[0] for row in rows}
 
+
     def latest_team_rating_week(self, season: str) -> Optional[int]:
         with self.engine.begin() as conn:
             row = conn.execute(
@@ -353,6 +354,7 @@ class NFLIngestor:
     def ingest(self, seasons: Iterable[str]) -> None:
         existing_games = self.db.fetch_existing_game_ids()
         games_with_stats = self.db.fetch_games_with_player_stats()
+
         logging.info("Found %d games already in database", len(existing_games))
 
         for season in seasons:
@@ -376,6 +378,7 @@ class NFLIngestor:
 
                 game_id_str = str(game_id)
                 have_player_stats = game_id_str in games_with_stats
+
 
                 score = game.get("score") or {}
                 start_time = parse_dt(schedule.get("startTime"))
@@ -438,6 +441,7 @@ class NFLIngestor:
                     logging.debug(
                         "No player gamelog entries returned for season %s game %s", season, game_id_str
                     )
+
                 for entry in gamelog_entries:
                     player = entry.get("player", {})
                     team = entry.get("team", {})
