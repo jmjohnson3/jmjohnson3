@@ -666,18 +666,74 @@ class NFLIngestor:
             )
             return []
 
-        totals = boxscore.get("playerStatsTotals") or []
+        game_info = boxscore.get("game", {}) or {}
+        team_lookup = {
+            "home": (game_info.get("homeTeam") or {}).get("abbreviation"),
+            "away": (game_info.get("awayTeam") or {}).get("abbreviation"),
+        }
+
+        stats_root = boxscore.get("stats") or {}
         normalized: List[Dict[str, Any]] = []
-        for total in totals:
-            if not isinstance(total, dict):
+        for side in ("home", "away"):
+            side_payload = stats_root.get(side) or {}
+            players = side_payload.get("players") or []
+            team_abbr = team_lookup.get(side)
+            for player_entry in players:
+                if not isinstance(player_entry, dict):
+                    continue
+                player_stats = self._normalize_boxscore_stat_groups(player_entry.get("playerStats"))
+                normalized.append(
+                    {
+                        "player": player_entry.get("player", {}) or {},
+                        "team": {"abbreviation": team_abbr} if team_abbr else {},
+                        "stats": player_stats,
+                    }
+                )
+
+        return normalized
+
+    @staticmethod
+    def _normalize_boxscore_stat_groups(raw_groups: Any) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """Convert boxscore player stat groups to the gamelog-style schema."""
+
+        if not isinstance(raw_groups, list):
+            return {}
+
+        normalized: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+        def assign(group: str, target: str, value: Any) -> None:
+            if value in (None, ""):
+                return
+            normalized.setdefault(group, {})[target] = {"value": value}
+
+        for group_entry in raw_groups:
+            if not isinstance(group_entry, dict):
                 continue
-            normalized.append(
-                {
-                    "player": total.get("player", {}) or {},
-                    "team": total.get("team", {}) or {},
-                    "stats": total.get("stats", {}) or {},
-                }
-            )
+            for group_name, metrics in group_entry.items():
+                if not isinstance(metrics, dict):
+                    continue
+                key = group_name.lower()
+                if key == "rushing":
+                    assign("Rushing", "RushingAttempts", metrics.get("rushAttempts"))
+                    assign("Rushing", "RushingYards", metrics.get("rushYards"))
+                    assign("Rushing", "RushingTD", metrics.get("rushTD"))
+                elif key == "receiving":
+                    assign("Receiving", "Targets", metrics.get("targets"))
+                    assign("Receiving", "Receptions", metrics.get("receptions"))
+                    assign("Receiving", "ReceivingYards", metrics.get("recYards"))
+                    assign("Receiving", "ReceivingTD", metrics.get("recTD"))
+                elif key == "passing":
+                    assign("Passing", "PassAttempts", metrics.get("passAttempts"))
+                    assign("Passing", "PassCompletions", metrics.get("passCompletions"))
+                    assign("Passing", "PassYards", metrics.get("passYards"))
+                    assign("Passing", "PassTD", metrics.get("passTD"))
+                elif key == "fumbles":
+                    assign("Fumbles", "Fumbles", metrics.get("fumbles"))
+                elif key == "snapcounts":
+                    offense_snaps = metrics.get("offenseSnaps")
+                    if offense_snaps is not None:
+                        assign("Miscellaneous", "Snaps", offense_snaps)
+
         return normalized
 
     @staticmethod
@@ -723,6 +779,7 @@ class NFLIngestor:
         )
 
         return first_numeric(score_payload, home_candidates), first_numeric(score_payload, away_candidates)
+
 # ---------------------------------------------------------------------------
 # Feature engineering & modeling
 # ---------------------------------------------------------------------------
@@ -1103,6 +1160,7 @@ class ModelTrainer:
             )
 
         preprocessor = ColumnTransformer(transformers=transformers)
+
         model = Pipeline([
             ("preprocessor", preprocessor),
             ("regressor", GradientBoostingRegressor(random_state=42)),
