@@ -622,7 +622,6 @@ class FeatureBuilder:
         games = games.copy()
         player_stats = player_stats.copy()
 
-
         # Basic cleanup
         games["start_time"] = pd.to_datetime(games["start_time"])
         games["day_of_week"] = games["day_of_week"].fillna(
@@ -634,6 +633,7 @@ class FeatureBuilder:
         )
 
         datasets: Dict[str, pd.DataFrame] = {}
+        team_strength: pd.DataFrame
 
         if player_stats.empty:
             logging.warning(
@@ -641,32 +641,29 @@ class FeatureBuilder:
             )
             team_strength = self._compute_team_unit_strength(player_stats)
         else:
+            enrichment_columns = [
+                "game_id",
+                "season",
+                "week",
+                "start_time",
+                "venue",
+                "city",
+                "state",
+                "day_of_week",
+                "referee",
+                "weather_conditions",
+                "temperature_f",
+                "home_team",
+                "away_team",
+            ]
             player_stats = player_stats.merge(
-                games[
-                    [
-                        "game_id",
-                        "season",
-                        "week",
-                        "start_time",
-                        "venue",
-                        "city",
-                        "state",
-                        "day_of_week",
-                        "referee",
-                        "weather_conditions",
-                        "temperature_f",
-                        "home_team",
-                        "away_team",
-                    ]
-                ],
+                games[enrichment_columns],
                 on="game_id",
                 how="left",
             )
 
-            # Rolling team strength metrics
             team_strength = self._compute_team_unit_strength(player_stats)
 
-            # Merge strength metrics into player stats
             player_stats = player_stats.merge(
                 team_strength,
                 on=["team", "season", "week"],
@@ -703,6 +700,7 @@ class FeatureBuilder:
                 how="left",
             )
 
+
             # Venue/day/referee/weather encoding via historical averages
             context_features = self._compute_contextual_averages(player_stats)
             player_stats = player_stats.merge(
@@ -728,117 +726,36 @@ class FeatureBuilder:
             add_dataset("receiving_tds", ["WR", "RB", "TE"])
             add_dataset("passing_tds", ["QB"])
 
-        # Game level dataset for winner & score prediction
-        games_context = games.merge(
-            team_strength.rename(
-                columns={
-                    "team": "home_team",
-                    "offense_pass_rating": "home_offense_pass_rating",
-                    "offense_rush_rating": "home_offense_rush_rating",
-                    "defense_pass_rating": "home_defense_pass_rating",
-                    "defense_rush_rating": "home_defense_rush_rating",
-                }
-            ),
-            on=["home_team", "season", "week"],
-            how="left",
-        ).merge(
-            team_strength.rename(
-                columns={
-                    "team": "away_team",
-                    "offense_pass_rating": "away_offense_pass_rating",
-                    "offense_rush_rating": "away_offense_rush_rating",
-                    "defense_pass_rating": "away_defense_pass_rating",
-                    "defense_rush_rating": "away_defense_rush_rating",
-                }
-            ),
-        player_stats = player_stats.merge(
-            games[
-                ["game_id", "season", "week", "start_time", "venue", "city", "state", "day_of_week", "referee", "weather_conditions", "temperature_f", "home_team", "away_team"]
-            ],
-            on="game_id",
-            how="left",
-        )
-
-        # Rolling team strength metrics
-        team_strength = self._compute_team_unit_strength(player_stats)
-
-        # Merge strength metrics into player stats
-        player_stats = player_stats.merge(
-            team_strength,
-            on=["team", "season", "week"],
-            how="left",
-            suffixes=("", "_team"),
-        )
-
-        opponent_strength = team_strength.rename(
+        home_strength = team_strength.rename(
             columns={
-                "team": "opponent",
-                "offense_pass_rating": "opp_offense_pass_rating",
-                "offense_rush_rating": "opp_offense_rush_rating",
-                "defense_pass_rating": "opp_defense_pass_rating",
-                "defense_rush_rating": "opp_defense_rush_rating",
-            }
-        )
 
-        player_stats = player_stats.merge(
-            games[["game_id", "home_team", "away_team"]],
-            on="game_id",
-            how="left",
-            suffixes=("", "_game"),
-        )
-
-        player_stats["opponent"] = np.where(
-            player_stats["team"] == player_stats["home_team"],
-            player_stats["away_team"],
-            player_stats["home_team"],
-        )
-
-        player_stats = player_stats.merge(
-            opponent_strength,
-            on=["opponent", "season", "week"],
-            how="left",
-        )
-
-        # Venue/day/referee/weather encoding via historical averages
-        context_features = self._compute_contextual_averages(player_stats)
-        player_stats = player_stats.merge(context_features, on=["team", "venue", "day_of_week", "referee"], how="left")
-
-        # Build dataset for each prediction target
-        datasets: Dict[str, pd.DataFrame] = {}
-
-        def add_dataset(target: str, positions: Iterable[str]) -> None:
-            subset = player_stats[player_stats["position"].isin(list(positions))].copy()
-            subset = subset[subset[target].notna()]
-            datasets[target] = subset
-
-        add_dataset("rushing_yards", ["RB", "HB", "FB", "QB"])
-        add_dataset("receiving_yards", ["WR", "RB", "HB", "FB", "TE"])
-        add_dataset("receptions", ["WR", "RB", "HB", "FB", "TE"])
-        add_dataset("rushing_tds", ["RB", "HB", "FB", "QB"])
-        add_dataset("receiving_tds", ["WR", "RB", "TE"])
-        add_dataset("passing_tds", ["QB"])
-
-        # Game level dataset for winner & score prediction
-        games_context = games.merge(
-            team_strength.rename(columns={
                 "team": "home_team",
                 "offense_pass_rating": "home_offense_pass_rating",
                 "offense_rush_rating": "home_offense_rush_rating",
                 "defense_pass_rating": "home_defense_pass_rating",
                 "defense_rush_rating": "home_defense_rush_rating",
-            }),
-            on=["home_team", "season", "week"],
-            how="left",
-        ).merge(
-            team_strength.rename(columns={
+            }
+        )
+        away_strength = team_strength.rename(
+            columns={
                 "team": "away_team",
                 "offense_pass_rating": "away_offense_pass_rating",
                 "offense_rush_rating": "away_offense_rush_rating",
                 "defense_pass_rating": "away_defense_pass_rating",
                 "defense_rush_rating": "away_defense_rush_rating",
-            }),
-            on=["away_team", "season", "week"],
-            how="left",
+            }
+        )
+
+        games_context = (
+            games.merge(
+                home_strength,
+                on=["home_team", "season", "week"],
+                how="left",
+            ).merge(
+                away_strength,
+                on=["away_team", "season", "week"],
+                how="left",
+            )
         )
 
         games_context["point_diff"] = games_context["home_score"] - games_context["away_score"]
@@ -849,7 +766,6 @@ class FeatureBuilder:
             )
         else:
             datasets["game_outcome"] = games_labeled
-
 
         return datasets
 
