@@ -208,12 +208,34 @@ class NFLDatabase:
     # Write helpers
     # ------------------------------------------------------------------
 
-    def upsert_rows(self, table: Table, rows: Iterable[Dict[str, Any]], conflict_cols: List[str]) -> None:
+    def upsert_rows(
+        self,
+        table: Table,
+        rows: Iterable[Dict[str, Any]],
+        conflict_cols: List[str],
+        update_columns: Optional[Iterable[str]] = None,
+    ) -> None:
         if not rows:
             return
         stmt = insert(table).values(list(rows))
-        update_cols = {col.name: stmt.excluded[col.name] for col in table.columns if col.name not in conflict_cols}
-        stmt = stmt.on_conflict_do_update(index_elements=conflict_cols, set_=update_cols)
+        if update_columns is None:
+            update_cols = {
+                col.name: stmt.excluded[col.name]
+                for col in table.columns
+                if col.name not in conflict_cols
+            }
+        else:
+            valid_columns = {
+                col
+                for col in update_columns
+                if col in table.c.keys() and col not in conflict_cols
+            }
+            update_cols = {col: stmt.excluded[col] for col in valid_columns}
+
+        if update_cols:
+            stmt = stmt.on_conflict_do_update(index_elements=conflict_cols, set_=update_cols)
+        else:
+            stmt = stmt.on_conflict_do_nothing(index_elements=conflict_cols)
         try:
             with self.engine.begin() as conn:
                 conn.execute(stmt)
@@ -437,7 +459,6 @@ class NFLIngestor:
                     logging.debug(
                         "No player gamelog entries returned for season %s game %s", season, game_id_str
                     )
-
                 for entry in gamelog_entries:
                     player = entry.get("player", {})
                     team = entry.get("team", {})
@@ -545,7 +566,19 @@ class NFLIngestor:
                 }
             )
 
-        self.db.upsert_rows(self.db.games, odds_rows, ["game_id"])
+        self.db.upsert_rows(
+            self.db.games,
+            odds_rows,
+            ["game_id"],
+            update_columns=[
+                "start_time",
+                "home_moneyline",
+                "away_moneyline",
+                "home_implied_prob",
+                "away_implied_prob",
+                "odds_updated",
+            ],
+        )
 
     @staticmethod
     def _safe_float(value: Any) -> Optional[float]:
@@ -700,8 +733,6 @@ class FeatureBuilder:
                 how="left",
             )
 
-
-            # Venue/day/referee/weather encoding via historical averages
             context_features = self._compute_contextual_averages(player_stats)
             player_stats = player_stats.merge(
                 context_features,
@@ -728,7 +759,6 @@ class FeatureBuilder:
 
         home_strength = team_strength.rename(
             columns={
-
                 "team": "home_team",
                 "offense_pass_rating": "home_offense_pass_rating",
                 "offense_rush_rating": "home_offense_rush_rating",
