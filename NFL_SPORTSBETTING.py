@@ -251,8 +251,37 @@ class MySportsFeedsClient:
         return resp.json()
 
     def fetch_games(self, season: str) -> List[Dict[str, Any]]:
-        data = self._request(f"{season}/games.json", params={"status": "completed,upcoming"})
-        return data.get("games", [])
+        """Fetch the schedule for a season, retrying with alternative filters."""
+
+        base_params: Dict[str, Any] = {"limit": 500}
+        attempts: Tuple[Optional[str], ...] = (
+            "completed,upcoming",
+            "final,inprogress,scheduled",
+            None,
+        )
+
+        for status_filter in attempts:
+            params = dict(base_params)
+            if status_filter:
+                params["status"] = status_filter
+
+            data = self._request(f"{season}/games.json", params=params)
+            games = data.get("games", [])
+            if games:
+                if status_filter and status_filter != attempts[0]:
+                    logging.debug(
+                        "Fetched %d games for %s after retrying with status filter '%s'",
+                        len(games),
+                        season,
+                        status_filter,
+                    )
+                return games
+
+        logging.debug(
+            "No games returned for %s even after retrying with multiple status filters",
+            season,
+        )
+        return []
 
     def fetch_game_boxscore(self, season: str, game_id: str) -> Dict[str, Any]:
         return self._request(f"{season}/games/{game_id}/boxscore.json")
@@ -978,6 +1007,7 @@ def main() -> None:
         if args.predict:
             logging.error("Prediction generation skipped because no models were available.")
         return
+
     models = trainer.train()
     if args.predict:
         predict_upcoming_games(models, engine, args.output)
