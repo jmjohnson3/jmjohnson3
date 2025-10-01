@@ -28,7 +28,6 @@ import numpy as np
 import pandas as pd
 import requests
 from requests import HTTPError
-
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.impute import SimpleImputer
@@ -370,11 +369,20 @@ class NFLIngestor:
                     logging.debug("Skipping already ingested game %s", game_id)
                     continue
 
-                score = game.get("score", {})
+                score = game.get("score") or {}
                 start_time = parse_dt(schedule.get("startTime"))
-                venue = schedule.get("venue", {})
-                weather = schedule.get("weather", {})
-                officials = schedule.get("officials", [])
+                venue = schedule.get("venue") or {}
+                weather = schedule.get("weather") or {}
+                officials = schedule.get("officials") or []
+
+                referee_name: Optional[str] = None
+                if officials:
+                    lead_official = officials[0] or {}
+                    first = lead_official.get("firstName", "")
+                    last = lead_official.get("lastName", "")
+                    referee_name = f"{first} {last}".strip()
+                    if not referee_name:
+                        referee_name = lead_official.get("fullName")
 
                 new_game_rows.append(
                     {
@@ -388,7 +396,7 @@ class NFLIngestor:
                         "country": venue.get("country"),
                         "surface": venue.get("surface"),
                         "day_of_week": start_time.strftime("%A") if start_time else None,
-                        "referee": officials[0].get("firstName") + " " + officials[0].get("lastName") if officials else None,
+                        "referee": referee_name,
                         "temperature_f": weather.get("temperature"),
                         "weather_conditions": weather.get("conditions"),
                         "home_team": schedule.get("homeTeam", {}).get("abbreviation"),
@@ -1020,8 +1028,6 @@ def main() -> None:
         if args.predict:
             logging.error("Prediction generation skipped because no models were available.")
         return
-
-    models = trainer.train()
     if args.predict:
         predict_upcoming_games(models, engine, args.output)
 
