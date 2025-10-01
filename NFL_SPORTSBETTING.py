@@ -233,7 +233,6 @@ class NFLDatabase:
             rows = conn.execute(select(self.player_stats.c.game_id).distinct()).fetchall()
         return {row[0] for row in rows}
 
-
     def latest_team_rating_week(self, season: str) -> Optional[int]:
         with self.engine.begin() as conn:
             row = conn.execute(
@@ -354,7 +353,6 @@ class NFLIngestor:
     def ingest(self, seasons: Iterable[str]) -> None:
         existing_games = self.db.fetch_existing_game_ids()
         games_with_stats = self.db.fetch_games_with_player_stats()
-
         logging.info("Found %d games already in database", len(existing_games))
 
         for season in seasons:
@@ -378,8 +376,6 @@ class NFLIngestor:
 
                 game_id_str = str(game_id)
                 have_player_stats = game_id_str in games_with_stats
-
-
                 score = game.get("score") or {}
                 start_time = parse_dt(schedule.get("startTime"))
                 venue = schedule.get("venue") or {}
@@ -618,8 +614,14 @@ class FeatureBuilder:
 
     def build_features(self) -> Dict[str, pd.DataFrame]:
         games, player_stats, _ = self.load_dataframes()
-        if games.empty or player_stats.empty:
-            raise RuntimeError("Insufficient data to build features")
+
+        if games.empty:
+            logging.warning("No games available in the database. Skipping model training.")
+            return {}
+
+        games = games.copy()
+        player_stats = player_stats.copy()
+
 
         # Basic cleanup
         games["start_time"] = pd.to_datetime(games["start_time"])
@@ -631,6 +633,124 @@ class FeatureBuilder:
             np.where(games["home_score"] < games["away_score"], "away", "push"),
         )
 
+        datasets: Dict[str, pd.DataFrame] = {}
+
+        if player_stats.empty:
+            logging.warning(
+                "Player statistics table is empty. Player-level models will not be trained."
+            )
+            team_strength = self._compute_team_unit_strength(player_stats)
+        else:
+            player_stats = player_stats.merge(
+                games[
+                    [
+                        "game_id",
+                        "season",
+                        "week",
+                        "start_time",
+                        "venue",
+                        "city",
+                        "state",
+                        "day_of_week",
+                        "referee",
+                        "weather_conditions",
+                        "temperature_f",
+                        "home_team",
+                        "away_team",
+                    ]
+                ],
+                on="game_id",
+                how="left",
+            )
+
+            # Rolling team strength metrics
+            team_strength = self._compute_team_unit_strength(player_stats)
+
+            # Merge strength metrics into player stats
+            player_stats = player_stats.merge(
+                team_strength,
+                on=["team", "season", "week"],
+                how="left",
+                suffixes=("", "_team"),
+            )
+
+            opponent_strength = team_strength.rename(
+                columns={
+                    "team": "opponent",
+                    "offense_pass_rating": "opp_offense_pass_rating",
+                    "offense_rush_rating": "opp_offense_rush_rating",
+                    "defense_pass_rating": "opp_defense_pass_rating",
+                    "defense_rush_rating": "opp_defense_rush_rating",
+                }
+            )
+
+            player_stats = player_stats.merge(
+                games[["game_id", "home_team", "away_team"]],
+                on="game_id",
+                how="left",
+                suffixes=("", "_game"),
+            )
+
+            player_stats["opponent"] = np.where(
+                player_stats["team"] == player_stats["home_team"],
+                player_stats["away_team"],
+                player_stats["home_team"],
+            )
+
+            player_stats = player_stats.merge(
+                opponent_strength,
+                on=["opponent", "season", "week"],
+                how="left",
+            )
+
+            # Venue/day/referee/weather encoding via historical averages
+            context_features = self._compute_contextual_averages(player_stats)
+            player_stats = player_stats.merge(
+                context_features,
+                on=["team", "venue", "day_of_week", "referee"],
+                how="left",
+            )
+
+            def add_dataset(target: str, positions: Iterable[str]) -> None:
+                subset = player_stats[player_stats["position"].isin(list(positions))].copy()
+                subset = subset[subset[target].notna()]
+                if subset.empty:
+                    logging.debug(
+                        "Skipping %s dataset because no rows remained after filtering", target
+                    )
+                    return
+                datasets[target] = subset
+
+            add_dataset("rushing_yards", ["RB", "HB", "FB", "QB"])
+            add_dataset("receiving_yards", ["WR", "RB", "HB", "FB", "TE"])
+            add_dataset("receptions", ["WR", "RB", "HB", "FB", "TE"])
+            add_dataset("rushing_tds", ["RB", "HB", "FB", "QB"])
+            add_dataset("receiving_tds", ["WR", "RB", "TE"])
+            add_dataset("passing_tds", ["QB"])
+
+        # Game level dataset for winner & score prediction
+        games_context = games.merge(
+            team_strength.rename(
+                columns={
+                    "team": "home_team",
+                    "offense_pass_rating": "home_offense_pass_rating",
+                    "offense_rush_rating": "home_offense_rush_rating",
+                    "defense_pass_rating": "home_defense_pass_rating",
+                    "defense_rush_rating": "home_defense_rush_rating",
+                }
+            ),
+            on=["home_team", "season", "week"],
+            how="left",
+        ).merge(
+            team_strength.rename(
+                columns={
+                    "team": "away_team",
+                    "offense_pass_rating": "away_offense_pass_rating",
+                    "offense_rush_rating": "away_offense_rush_rating",
+                    "defense_pass_rating": "away_defense_pass_rating",
+                    "defense_rush_rating": "away_defense_rush_rating",
+                }
+            ),
         player_stats = player_stats.merge(
             games[
                 ["game_id", "season", "week", "start_time", "venue", "city", "state", "day_of_week", "referee", "weather_conditions", "temperature_f", "home_team", "away_team"]
@@ -722,11 +842,32 @@ class FeatureBuilder:
         )
 
         games_context["point_diff"] = games_context["home_score"] - games_context["away_score"]
-        datasets["game_outcome"] = games_context.dropna(subset=["home_score", "away_score"])
+        games_labeled = games_context.dropna(subset=["home_score", "away_score"])
+        if games_labeled.empty:
+            logging.warning(
+                "No completed games with scores available. Game outcome model will be skipped."
+            )
+        else:
+            datasets["game_outcome"] = games_labeled
+
 
         return datasets
 
     def _compute_team_unit_strength(self, player_stats: pd.DataFrame) -> pd.DataFrame:
+        if player_stats.empty:
+            return pd.DataFrame(
+                columns=
+                [
+                    "season",
+                    "week",
+                    "team",
+                    "offense_pass_rating",
+                    "offense_rush_rating",
+                    "defense_pass_rating",
+                    "defense_rush_rating",
+                ]
+            )
+
         grouped = (
             player_stats.groupby(["season", "week", "team"])
             .agg(
@@ -762,6 +903,22 @@ class FeatureBuilder:
         return grouped[cols]
 
     def _compute_contextual_averages(self, player_stats: pd.DataFrame) -> pd.DataFrame:
+        if player_stats.empty:
+            return pd.DataFrame(
+                columns=
+                [
+                    "team",
+                    "venue",
+                    "day_of_week",
+                    "referee",
+                    "avg_rush_yards",
+                    "avg_rec_yards",
+                    "avg_receptions",
+                    "avg_rush_tds",
+                    "avg_rec_tds",
+                ]
+            )
+
         context = (
             player_stats.groupby(["team", "venue", "day_of_week", "referee"])
             .agg(
@@ -802,6 +959,15 @@ class ModelTrainer:
         return models
 
     def _train_regression_model(self, df: pd.DataFrame, target: str) -> Optional[Pipeline]:
+        if len(df) < 20 or df[target].nunique() <= 1:
+            logging.warning(
+                "Not enough data to train %s model (rows=%d, unique targets=%d).", 
+                target,
+                len(df),
+                df[target].nunique(),
+            )
+            return None
+
         numeric_features = [
             "week",
             "temperature_f",
@@ -859,6 +1025,13 @@ class ModelTrainer:
         return model
 
     def _train_game_models(self, df: pd.DataFrame) -> Dict[str, Pipeline]:
+        if len(df) < 20 or df["game_result"].nunique() <= 1:
+            logging.warning(
+                "Not enough completed games (%d) with outcomes to train game-level models.",
+                len(df),
+            )
+            return {}
+
         numeric_features = [
             "week",
             "temperature_f",
