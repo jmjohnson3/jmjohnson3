@@ -398,7 +398,6 @@ class NFLIngestor:
 
                 game_id_str = str(game_id)
                 have_player_stats = game_id_str in games_with_stats
-
                 score = game.get("score") or {}
                 home_score, away_score = self._extract_score_totals(score)
                 start_time = parse_dt(schedule.get("startTime"))
@@ -678,7 +677,6 @@ class NFLIngestor:
 
         return first_numeric(score_payload, home_candidates), first_numeric(score_payload, away_candidates)
 
-
 # ---------------------------------------------------------------------------
 # Feature engineering & modeling
 # ---------------------------------------------------------------------------
@@ -702,6 +700,7 @@ class FeatureBuilder:
         games = games.rename(columns=lambda col: str(col))
         player_stats = player_stats.rename(columns=lambda col: str(col))
         team_ratings = team_ratings.rename(columns=lambda col: str(col))
+
         return games, player_stats, team_ratings
 
     def build_features(self) -> Dict[str, pd.DataFrame]:
@@ -1045,6 +1044,7 @@ class ModelTrainer:
             )
         if available_categorical:
             transformers.append(
+
                 (
                     "cat",
                     Pipeline([
@@ -1056,6 +1056,7 @@ class ModelTrainer:
             )
 
         preprocessor = ColumnTransformer(transformers=transformers)
+
 
         model = Pipeline([
             ("preprocessor", preprocessor),
@@ -1123,6 +1124,7 @@ class ModelTrainer:
         feature_columns = available_numeric + available_categorical
 
         X = df[feature_columns]
+
         y_winner = (df["game_result"] == "home").astype(int)
         y_home_score = df["home_score"]
         y_away_score = df["away_score"]
@@ -1138,6 +1140,7 @@ class ModelTrainer:
             )
         if available_categorical:
             transformers.append(
+
                 (
                     "cat",
                     Pipeline([
