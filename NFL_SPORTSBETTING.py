@@ -1044,11 +1044,13 @@ class ModelTrainer:
             )
         if available_categorical:
             transformers.append(
-
                 (
                     "cat",
                     Pipeline([
-                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        (
+                            "imputer",
+                            SimpleImputer(strategy="constant", fill_value="missing"),
+                        ),
                         ("onehot", OneHotEncoder(handle_unknown="ignore")),
                     ]),
                     available_categorical,
@@ -1140,11 +1142,14 @@ class ModelTrainer:
             )
         if available_categorical:
             transformers.append(
-
                 (
                     "cat",
                     Pipeline([
-                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        (
+                            "imputer",
+                            SimpleImputer(strategy="constant", fill_value="missing"),
+                        ),
+
                         ("onehot", OneHotEncoder(handle_unknown="ignore")),
                     ]),
                     available_categorical,
