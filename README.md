@@ -1,16 +1,16 @@
-## Hi there 👋
+## Usage
 
-<!--
-**jmjohnson3/jmjohnson3** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+```bash
+python ingest.py 2024-regular --username YOUR_USER --password YOUR_PASS
+```
 
-Here are some ideas to get you started:
+The CLI now enumerates completed weeks automatically. By default the tool
+discovers every week with games (`--all-weeks` is enabled) and uses that list
+for both game and player gamelog ingestion. The upcoming week value is
+calculated as the next week after the final completed one.
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+To ingest a narrow range instead, provide an explicit list or range with
+`--weeks` (for example `--weeks 3-5,8`). When you pass `--weeks`, you can keep
+`--all-weeks` enabled (the default) to backfill missing weeks automatically, or
+disable it with `--no-all-weeks` to ingest only the explicit list. Override the
+computed upcoming week with `--upcoming-week WEEK_NUMBER` when needed.
