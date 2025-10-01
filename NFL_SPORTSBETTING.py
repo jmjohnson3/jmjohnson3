@@ -397,7 +397,7 @@ class NFLIngestor:
                         "surface": venue.get("surface"),
                         "day_of_week": start_time.strftime("%A") if start_time else None,
                         "referee": referee_name,
-                        "temperature_f": weather.get("temperature"),
+                        "temperature_f": self._extract_temperature_fahrenheit(weather.get("temperature")),
                         "weather_conditions": weather.get("conditions"),
                         "home_team": schedule.get("homeTeam", {}).get("abbreviation"),
                         "away_team": schedule.get("awayTeam", {}).get("abbreviation"),
@@ -525,6 +525,35 @@ class NFLIngestor:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _extract_temperature_fahrenheit(value: Any) -> Optional[float]:
+        """Normalize temperature payloads into a Fahrenheit float."""
+
+        if value is None:
+            return None
+
+        if isinstance(value, dict):
+            candidates = [
+                value.get("fahrenheit"),
+                value.get("F"),
+                value.get("tempF"),
+                value.get("value"),
+            ]
+            for candidate in candidates:
+                result = NFLIngestor._safe_float(candidate)
+                if result is not None:
+                    return result
+            return None
+
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                result = NFLIngestor._extract_temperature_fahrenheit(item)
+                if result is not None:
+                    return result
+            return None
+
+        return NFLIngestor._safe_float(value)
 
     @staticmethod
     def _infer_season(start_time: Optional[dt.datetime]) -> Optional[str]:
@@ -1028,6 +1057,7 @@ def main() -> None:
         if args.predict:
             logging.error("Prediction generation skipped because no models were available.")
         return
+
     if args.predict:
         predict_upcoming_games(models, engine, args.output)
 
