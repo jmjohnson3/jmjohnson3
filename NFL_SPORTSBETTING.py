@@ -398,7 +398,6 @@ class NFLIngestor:
 
                 game_id_str = str(game_id)
                 have_player_stats = game_id_str in games_with_stats
-
                 score = game.get("score") or {}
                 home_score, away_score = self._extract_score_totals(score)
                 start_time = parse_dt(schedule.get("startTime"))
@@ -678,7 +677,6 @@ class NFLIngestor:
 
         return first_numeric(score_payload, home_candidates), first_numeric(score_payload, away_candidates)
 
-
 # ---------------------------------------------------------------------------
 # Feature engineering & modeling
 # ---------------------------------------------------------------------------
@@ -702,6 +700,7 @@ class FeatureBuilder:
         games = games.rename(columns=lambda col: str(col))
         player_stats = player_stats.rename(columns=lambda col: str(col))
         team_ratings = team_ratings.rename(columns=lambda col: str(col))
+
         return games, player_stats, team_ratings
 
     def build_features(self) -> Dict[str, pd.DataFrame]:
