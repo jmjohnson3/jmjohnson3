@@ -376,7 +376,6 @@ class NFLIngestor:
 
                 game_id_str = str(game_id)
                 have_player_stats = game_id_str in games_with_stats
-
                 score = game.get("score") or {}
                 start_time = parse_dt(schedule.get("startTime"))
                 venue = schedule.get("venue") or {}
@@ -438,6 +437,7 @@ class NFLIngestor:
                     logging.debug(
                         "No player gamelog entries returned for season %s game %s", season, game_id_str
                     )
+
                 for entry in gamelog_entries:
                     player = entry.get("player", {})
                     team = entry.get("team", {})
@@ -700,6 +700,8 @@ class FeatureBuilder:
                 how="left",
             )
 
+
+            # Venue/day/referee/weather encoding via historical averages
             context_features = self._compute_contextual_averages(player_stats)
             player_stats = player_stats.merge(
                 context_features,
@@ -726,6 +728,7 @@ class FeatureBuilder:
 
         home_strength = team_strength.rename(
             columns={
+
                 "team": "home_team",
                 "offense_pass_rating": "home_offense_pass_rating",
                 "offense_rush_rating": "home_offense_rush_rating",
