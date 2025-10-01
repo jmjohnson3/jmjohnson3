@@ -1008,6 +1008,7 @@ def main() -> None:
             logging.error("Prediction generation skipped because no models were available.")
         return
 
+    models = trainer.train()
     if args.predict:
         predict_upcoming_games(models, engine, args.output)
 
