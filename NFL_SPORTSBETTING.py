@@ -77,6 +77,84 @@ ODDS_FORMAT = "american"
 
 DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
+
+# ---------------------------------------------------------------------------
+# Static data helpers
+# ---------------------------------------------------------------------------
+
+
+TEAM_NAME_TO_ABBR = {
+    "arizona cardinals": "ARI",
+    "atlanta falcons": "ATL",
+    "baltimore ravens": "BAL",
+    "buffalo bills": "BUF",
+    "carolina panthers": "CAR",
+    "chicago bears": "CHI",
+    "cincinnati bengals": "CIN",
+    "cleveland browns": "CLE",
+    "dallas cowboys": "DAL",
+    "denver broncos": "DEN",
+    "detroit lions": "DET",
+    "green bay packers": "GB",
+    "houston texans": "HOU",
+    "indianapolis colts": "IND",
+    "jacksonville jaguars": "JAX",
+    "jacksonville jaguar": "JAX",
+    "kansas city chiefs": "KC",
+    "las vegas raiders": "LV",
+    "oakland raiders": "LV",
+    "los angeles chargers": "LAC",
+    "la chargers": "LAC",
+    "los angeles rams": "LAR",
+    "la rams": "LAR",
+    "miami dolphins": "MIA",
+    "minnesota vikings": "MIN",
+    "new england patriots": "NE",
+    "new orleans saints": "NO",
+    "new york giants": "NYG",
+    "ny giants": "NYG",
+    "new york jets": "NYJ",
+    "ny jets": "NYJ",
+    "philadelphia eagles": "PHI",
+    "pittsburgh steelers": "PIT",
+    "san francisco 49ers": "SF",
+    "sf 49ers": "SF",
+    "seattle seahawks": "SEA",
+    "tampa bay buccaneers": "TB",
+    "tennessee titans": "TEN",
+    "washington commanders": "WAS",
+    "washington football team": "WAS",
+    "washington redskins": "WAS",
+}
+
+
+def normalize_team_abbr(value: Any) -> Optional[str]:
+    """Convert free-form team descriptors into standard three-letter abbreviations."""
+
+    if value is None:
+        return None
+    if isinstance(value, float) and np.isnan(value):  # type: ignore[arg-type]
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    candidate = text.upper().replace(" ", "")
+    if len(candidate) <= 4 and candidate.isalpha():
+        return candidate
+
+    key = text.lower().replace(".", "").strip()
+    if key in TEAM_NAME_TO_ABBR:
+        return TEAM_NAME_TO_ABBR[key]
+
+    # Handle alternate spacing such as "los angeles" vs "losangeles".
+    compact_key = key.replace(" ", "")
+    if compact_key in TEAM_NAME_TO_ABBR:
+        return TEAM_NAME_TO_ABBR[compact_key]
+
+    return text.upper()
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -2093,16 +2171,41 @@ def predict_upcoming_games(
     output_path: Optional[Path] = None,
     save_json: bool = False,
 ) -> Dict[str, pd.DataFrame]:
-    games = pd.read_sql_table("nfl_games", engine).rename(columns=lambda col: str(col))
-    games["start_time"] = pd.to_datetime(games["start_time"])
-    games["day_of_week"] = games["day_of_week"].where(
-        games["day_of_week"].notna(), games["start_time"].dt.day_name()
+    feature_builder = FeatureBuilder(engine)
+    feature_builder.build_features()
+
+    base_games = pd.read_sql_table("nfl_games", engine).rename(columns=lambda col: str(col))
+    base_games["start_time"] = pd.to_datetime(base_games["start_time"])
+    base_games["day_of_week"] = base_games["day_of_week"].where(
+        base_games["day_of_week"].notna(), base_games["start_time"].dt.day_name()
     )
 
-    upcoming_mask = (games["status"].isin(["upcoming", "scheduled", "inprogress"])) | games["home_score"].isna()
-    upcoming = games.loc[upcoming_mask].copy()
+    games_source = feature_builder.games_frame
+    if games_source is not None and not games_source.empty:
+        games_source = games_source.copy()
+        games_source = games_source.rename(columns=lambda col: str(col))
+    else:
+        games_source = base_games
+
+    games_source["start_time"] = pd.to_datetime(games_source["start_time"])
+    games_source["day_of_week"] = games_source["day_of_week"].where(
+        games_source["day_of_week"].notna(), games_source["start_time"].dt.day_name()
+    )
+
+    if "odds_updated" not in games_source.columns:
+        games_source["odds_updated"] = pd.NaT
+
+    upcoming_mask = (games_source["status"].isin(["upcoming", "scheduled", "inprogress"])) | games_source["home_score"].isna()
+    upcoming = games_source.loc[upcoming_mask].copy()
     if upcoming.empty:
         logging.warning("No upcoming games found for prediction")
+        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+
+    upcoming["home_team"] = upcoming["home_team"].apply(normalize_team_abbr)
+    upcoming["away_team"] = upcoming["away_team"].apply(normalize_team_abbr)
+    upcoming = upcoming[upcoming["home_team"].notna() & upcoming["away_team"].notna()]
+    if upcoming.empty:
+        logging.warning("Upcoming games are missing team assignments after normalization")
         return {"games": pd.DataFrame(), "players": pd.DataFrame()}
 
     upcoming = upcoming[upcoming["day_of_week"].isin(["Thursday", "Sunday", "Monday"])]
@@ -2110,8 +2213,29 @@ def predict_upcoming_games(
         logging.warning("No Thursday/Sunday/Monday games available for prediction")
         return {"games": pd.DataFrame(), "players": pd.DataFrame()}
 
-    feature_builder = FeatureBuilder(engine)
-    feature_builder.build_features()
+    upcoming["_priority"] = upcoming["game_id"].apply(
+        lambda value: 0 if isinstance(value, str) and value.isdigit() else 1
+    )
+    upcoming = upcoming.sort_values(
+        ["_priority", "odds_updated", "start_time"], ascending=[True, False, True]
+    )
+    upcoming = upcoming.drop_duplicates(
+        subset=["home_team", "away_team", "start_time"], keep="first"
+    )
+    upcoming = upcoming.drop(columns="_priority", errors="ignore")
+
+    earliest_start = upcoming["start_time"].min()
+    if pd.notna(earliest_start):
+        week_start = earliest_start.normalize() - pd.to_timedelta(earliest_start.weekday(), unit="D")
+        week_end = week_start + pd.Timedelta(days=6)
+        week_window_mask = (upcoming["start_time"] >= week_start) & (upcoming["start_time"] <= week_end)
+        upcoming = upcoming.loc[week_window_mask]
+
+    if upcoming.empty:
+        logging.warning("No upcoming games within the current week window")
+        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+
+    upcoming = upcoming.sort_values("start_time").reset_index(drop=True)
 
     def _ensure_model_features(frame: pd.DataFrame, model: Pipeline) -> pd.DataFrame:
         columns = getattr(model, "feature_columns", None)
@@ -2145,13 +2269,23 @@ def predict_upcoming_games(
     scoreboard["home_win_probability"] = winner_probs
     scoreboard["date"] = scoreboard["start_time"].dt.date.astype(str)
     scoreboard = scoreboard[
-        ["game_id", "date", "away_team", "home_team", "away_score", "home_score", "home_win_probability"]
+        [
+            "game_id",
+            "date",
+            "start_time",
+            "away_team",
+            "home_team",
+            "away_score",
+            "home_score",
+            "home_win_probability",
+        ]
     ].rename(
         columns={
             "away_team": "away_team_abbr",
             "home_team": "home_team_abbr",
         }
     )
+    scoreboard = scoreboard.sort_values(["date", "start_time", "game_id"]).reset_index(drop=True)
 
     # Player-level predictions
     player_features = feature_builder.prepare_upcoming_player_features(upcoming)
@@ -2243,9 +2377,19 @@ def predict_upcoming_games(
     print(report_text)
 
     if save_json and output_path is not None:
+        games_payload = scoreboard.copy()
+        games_payload["start_time"] = games_payload["start_time"].astype(str)
+
+        players_payload = player_predictions.drop(
+            columns=[col for col in player_predictions.columns if col.startswith("_")],
+            errors="ignore",
+        )
+        if "start_time" in players_payload.columns:
+            players_payload["start_time"] = players_payload["start_time"].astype(str)
+
         output_payload = {
-            "games": scoreboard.to_dict(orient="records"),
-            "players": player_predictions.drop(columns=[col for col in player_predictions.columns if col.startswith("_")]).to_dict(orient="records"),
+            "games": games_payload.to_dict(orient="records"),
+            "players": players_payload.to_dict(orient="records"),
         }
         output_path.write_text(json.dumps(output_payload, indent=2))
         logging.info("Saved prediction summary to %s", output_path)
