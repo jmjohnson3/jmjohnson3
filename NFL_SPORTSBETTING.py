@@ -23,6 +23,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -164,6 +165,12 @@ TEAM_ABBR_CANONICAL = {
     "WAS": "washington commanders",
 }
 
+TEAM_ABBR_ALIASES = {
+    "LA": "LAR",
+    "STL": "LAR",
+    "SD": "LAC",
+}
+
 _NULL_TEAM_TOKENS = {"", "none", "null", "nan", "tbd", "tba", "n/a", "na", "--"}
 
 TEAM_MASCOT_TO_ABBR = {
@@ -234,6 +241,8 @@ def normalize_team_abbr(value: Any) -> Optional[str]:
     if len(candidate) <= 4 and candidate.isalpha():
         if candidate in TEAM_ABBR_CANONICAL:
             return candidate
+        if candidate in TEAM_ABBR_ALIASES:
+            return TEAM_ABBR_ALIASES[candidate]
         # Some feeds already provide three-letter abbreviations with spaces
         spaced_candidate = " ".join(candidate)
         if spaced_candidate in TEAM_NAME_TO_ABBR:
@@ -245,6 +254,10 @@ def normalize_team_abbr(value: Any) -> Optional[str]:
 
     if sanitized in TEAM_NAME_TO_ABBR:
         return TEAM_NAME_TO_ABBR[sanitized]
+
+    sanitized_candidate = sanitized.replace(" ", "").upper()
+    if sanitized_candidate in TEAM_ABBR_ALIASES:
+        return TEAM_ABBR_ALIASES[sanitized_candidate]
 
     compact_key = sanitized.replace(" ", "")
     if compact_key in TEAM_NAME_TO_ABBR:
@@ -1448,18 +1461,22 @@ class FeatureBuilder:
         latest_players = latest_players[latest_players["team"].notna()]
 
         games = upcoming_games.copy()
-        games["start_time"] = pd.to_datetime(games["start_time"])
+        games["start_time"] = pd.to_datetime(games["start_time"], utc=True, errors="coerce")
+        games = games[games["start_time"].notna()]
+        eastern = ZoneInfo("America/New_York")
+        if "local_start_time" in games.columns:
+            games["local_start_time"] = pd.to_datetime(
+                games["local_start_time"], utc=True, errors="coerce"
+            ).dt.tz_convert(eastern)
+        else:
+            games["local_start_time"] = games["start_time"].dt.tz_convert(eastern)
+
         if "day_of_week" in games.columns:
             games["day_of_week"] = games["day_of_week"].where(
-                games["day_of_week"].notna(), games["start_time"].dt.day_name()
+                games["day_of_week"].notna(), games["local_start_time"].dt.day_name()
             )
         else:
-            games["day_of_week"] = games["start_time"].dt.day_name()
-        early_mask = games["start_time"].dt.hour < 6
-        if early_mask.any():
-            games.loc[early_mask, "day_of_week"] = (
-                games.loc[early_mask, "start_time"] - pd.Timedelta(days=1)
-            ).dt.day_name()
+            games["day_of_week"] = games["local_start_time"].dt.day_name()
         games["home_team"] = games["home_team"].apply(normalize_team_abbr)
         games["away_team"] = games["away_team"].apply(normalize_team_abbr)
 
@@ -1493,11 +1510,54 @@ class FeatureBuilder:
 
                 for pos_key, count in starters_per_position.items():
                     allowed_positions = position_groups.get(pos_key, {pos_key})
-                    position_candidates = candidates[candidates["position"].isin(allowed_positions)]
+                    position_candidates = candidates[
+                        candidates["position"].isin(allowed_positions)
+                    ]
                     if position_candidates.empty:
                         continue
+                    position_candidates = position_candidates.copy()
+
+                    if pos_key == "QB":
+                        sort_cols = [
+                            "passing_attempts",
+                            "passing_yards",
+                            "fantasy_points",
+                            "snap_count",
+                        ]
+                    elif pos_key == "RB":
+                        sort_cols = [
+                            "rushing_attempts",
+                            "rushing_yards",
+                            "receiving_targets",
+                            "snap_count",
+                            "fantasy_points",
+                        ]
+                    elif pos_key == "WR":
+                        sort_cols = [
+                            "receiving_targets",
+                            "receiving_yards",
+                            "receptions",
+                            "fantasy_points",
+                        ]
+                    elif pos_key == "TE":
+                        sort_cols = [
+                            "receiving_targets",
+                            "receptions",
+                            "receiving_yards",
+                            "fantasy_points",
+                        ]
+                    else:
+                        sort_cols = ["snap_count", "fantasy_points"]
+
+                    for col in sort_cols:
+                        if col not in position_candidates.columns:
+                            position_candidates[col] = 0.0
+                        else:
+                            position_candidates[col] = position_candidates[col].fillna(0.0)
+
+                    ascending_flags = [False] * len(sort_cols)
                     position_candidates = position_candidates.sort_values(
-                        ["snap_count", "fantasy_points"], ascending=[False, False]
+                        sort_cols, ascending=ascending_flags
                     )
                     pos_selected = 0
                     for _, player_row in position_candidates.iterrows():
@@ -1519,6 +1579,7 @@ class FeatureBuilder:
                     row_copy["season"] = season
                     row_copy["week"] = week
                     row_copy["start_time"] = start_time
+                    row_copy["local_start_time"] = getattr(game, "local_start_time", pd.NaT)
                     row_copy["venue"] = venue
                     row_copy["city"] = city
                     row_copy["state"] = state
@@ -2366,16 +2427,12 @@ def predict_upcoming_games(
         logging.warning("Upcoming games are missing valid start times after normalization")
         return {"games": pd.DataFrame(), "players": pd.DataFrame()}
 
+    eastern = ZoneInfo("America/New_York")
+    upcoming["local_start_time"] = upcoming["start_time"].dt.tz_convert(eastern)
+    upcoming["local_day_of_week"] = upcoming["local_start_time"].dt.day_name()
     upcoming["day_of_week"] = upcoming["day_of_week"].where(
-        upcoming["day_of_week"].notna(), upcoming["start_time"].dt.day_name()
+        upcoming["day_of_week"].notna(), upcoming["local_day_of_week"]
     )
-
-    early_kick_mask = upcoming["start_time"].dt.hour < 6
-    if early_kick_mask.any():
-        adjusted_days = (
-            upcoming.loc[early_kick_mask, "start_time"] - pd.Timedelta(days=1)
-        ).dt.day_name()
-        upcoming.loc[early_kick_mask, "day_of_week"] = adjusted_days
 
     now_utc = dt.datetime.now(dt.timezone.utc)
     lookback = now_utc - pd.Timedelta(hours=12)
@@ -2409,7 +2466,7 @@ def predict_upcoming_games(
     upcoming = window_games
 
     desired_days = {"Thursday", "Sunday", "Monday"}
-    upcoming = upcoming[upcoming["day_of_week"].isin(desired_days)]
+    upcoming = upcoming[upcoming["local_day_of_week"].isin(desired_days)]
     if upcoming.empty:
         logging.warning("No Thursday/Sunday/Monday games available for prediction")
         return {"games": pd.DataFrame(), "players": pd.DataFrame()}
@@ -2453,16 +2510,23 @@ def predict_upcoming_games(
     home_predictions = models["home_points"].predict(home_features)
     winner_probs = models["game_winner"].predict_proba(winner_features)[:, 1]
 
-    scoreboard = upcoming[["game_id", "start_time", "away_team", "home_team"]].copy()
+    scoreboard = upcoming[[
+        "game_id",
+        "start_time",
+        "local_start_time",
+        "away_team",
+        "home_team",
+    ]].copy()
     scoreboard["away_score"] = away_predictions
     scoreboard["home_score"] = home_predictions
     scoreboard["home_win_probability"] = winner_probs
-    scoreboard["date"] = scoreboard["start_time"].dt.date.astype(str)
+    scoreboard["date"] = scoreboard["local_start_time"].dt.date.astype(str)
     scoreboard = scoreboard[
         [
             "game_id",
             "date",
             "start_time",
+            "local_start_time",
             "away_team",
             "home_team",
             "away_score",
@@ -2569,6 +2633,8 @@ def predict_upcoming_games(
     if save_json and output_path is not None:
         games_payload = scoreboard.copy()
         games_payload["start_time"] = games_payload["start_time"].astype(str)
+        if "local_start_time" in games_payload.columns:
+            games_payload["local_start_time"] = games_payload["local_start_time"].astype(str)
 
         players_payload = player_predictions.drop(
             columns=[col for col in player_predictions.columns if col.startswith("_")],
@@ -2576,6 +2642,8 @@ def predict_upcoming_games(
         )
         if "start_time" in players_payload.columns:
             players_payload["start_time"] = players_payload["start_time"].astype(str)
+        if "local_start_time" in players_payload.columns:
+            players_payload["local_start_time"] = players_payload["local_start_time"].astype(str)
 
         output_payload = {
             "games": games_payload.to_dict(orient="records"),
