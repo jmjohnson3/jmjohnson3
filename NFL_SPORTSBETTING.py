@@ -1025,39 +1025,159 @@ class FeatureBuilder:
                 ]
             )
 
-        grouped = (
-            player_stats.groupby(["season", "week", "team"])
+        stats = player_stats.copy()
+
+        numeric_cols = [
+            "rushing_yards",
+            "rushing_attempts",
+            "passing_yards",
+            "passing_attempts",
+        ]
+        for col in numeric_cols:
+            if col not in stats.columns:
+                stats[col] = 0.0
+            stats[col] = stats[col].fillna(0)
+
+        team_offense = (
+            stats.dropna(subset=["team", "season", "week"])
+            .groupby(["season", "week", "team"], as_index=False)
             .agg(
                 rush_yards=pd.NamedAgg(column="rushing_yards", aggfunc="sum"),
-                rush_tds=pd.NamedAgg(column="rushing_tds", aggfunc="sum"),
-                rec_yards=pd.NamedAgg(column="receiving_yards", aggfunc="sum"),
-                rec_tds=pd.NamedAgg(column="receiving_tds", aggfunc="sum"),
+                rush_att=pd.NamedAgg(column="rushing_attempts", aggfunc="sum"),
                 pass_yards=pd.NamedAgg(column="passing_yards", aggfunc="sum"),
-                pass_tds=pd.NamedAgg(column="passing_tds", aggfunc="sum"),
+                pass_att=pd.NamedAgg(column="passing_attempts", aggfunc="sum"),
             )
-            .reset_index()
         )
 
-        grouped = grouped.sort_values(["team", "season", "week"]).reset_index(drop=True)
-        for col in ["rush_yards", "rush_tds", "rec_yards", "rec_tds", "pass_yards", "pass_tds"]:
-            grouped[f"rolling_{col}"] = (
-                grouped.groupby(["team", "season"])[col]
-                .rolling(window=4, min_periods=1)
-                .mean()
-                .reset_index(level=[0, 1], drop=True)
+        # Map each team to its opponent for the given week so we can measure yards allowed.
+        opponent_map = (
+            stats[
+                [
+                    "season",
+                    "week",
+                    "team",
+                    "home_team",
+                    "away_team",
+                ]
+            ]
+            .dropna(subset=["team", "home_team", "away_team", "season", "week"])
+            .drop_duplicates()
+        )
+        opponent_map["opponent"] = np.where(
+            opponent_map["team"] == opponent_map["home_team"],
+            opponent_map["away_team"],
+            np.where(
+                opponent_map["team"] == opponent_map["away_team"],
+                opponent_map["home_team"],
+                np.nan,
+            ),
+        )
+        opponent_map = opponent_map.dropna(subset=["opponent"]).drop_duplicates(
+            subset=["season", "week", "team"]
+        )
+
+        opponent_totals = team_offense.rename(
+            columns={
+                "team": "opponent",
+                "rush_yards": "opp_rush_yards",
+                "rush_att": "opp_rush_att",
+                "pass_yards": "opp_pass_yards",
+                "pass_att": "opp_pass_att",
+            }
+        )
+
+        defense_allowed = opponent_map.merge(
+            opponent_totals,
+            on=["season", "week", "opponent"],
+            how="left",
+        )
+
+        combined = team_offense.merge(
+            defense_allowed[
+                [
+                    "season",
+                    "week",
+                    "team",
+                    "opp_rush_yards",
+                    "opp_rush_att",
+                    "opp_pass_yards",
+                    "opp_pass_att",
+                ]
+            ],
+            on=["season", "week", "team"],
+            how="left",
+        )
+
+        # Compute per-attempt efficiency for offense and defense.
+        combined["rush_per_att"] = np.where(
+            combined["rush_att"] > 0,
+            combined["rush_yards"] / combined["rush_att"],
+            np.nan,
+        )
+        combined["pass_per_att"] = np.where(
+            combined["pass_att"] > 0,
+            combined["pass_yards"] / combined["pass_att"],
+            np.nan,
+        )
+        combined["allowed_rush_per_att"] = np.where(
+            combined["opp_rush_att"] > 0,
+            combined["opp_rush_yards"] / combined["opp_rush_att"],
+            np.nan,
+        )
+        combined["allowed_pass_per_att"] = np.where(
+            combined["opp_pass_att"] > 0,
+            combined["opp_pass_yards"] / combined["opp_pass_att"],
+            np.nan,
+        )
+
+        league_baselines = (
+            combined.groupby(["season", "week"], as_index=False)
+            .agg(
+                league_rush_per_att=pd.NamedAgg(column="rush_per_att", aggfunc="mean"),
+                league_pass_per_att=pd.NamedAgg(column="pass_per_att", aggfunc="mean"),
             )
+        )
 
-        # Offense: use rushing and passing production. Defense approximated by opponent restriction.
-        grouped["offense_rush_rating"] = grouped[["rolling_rush_yards", "rolling_rush_tds"]].mean(axis=1)
-        grouped["offense_pass_rating"] = grouped[["rolling_pass_yards", "rolling_pass_tds", "rolling_rec_yards", "rolling_rec_tds"]].mean(axis=1)
+        combined = combined.merge(
+            league_baselines,
+            on=["season", "week"],
+            how="left",
+        )
 
-        # Defense derived by comparing to league averages (placeholder). In practice, integrate opponent stats.
-        grouped["defense_rush_rating"] = grouped.groupby(["season", "week"])["offense_rush_rating"].transform("mean") - grouped["offense_rush_rating"]
-        grouped["defense_pass_rating"] = grouped.groupby(["season", "week"])["offense_pass_rating"].transform("mean") - grouped["offense_pass_rating"]
+        combined["offense_rush_rating"] = (
+            combined["rush_per_att"] - combined["league_rush_per_att"]
+        )
+        combined["offense_pass_rating"] = (
+            combined["pass_per_att"] - combined["league_pass_per_att"]
+        )
+        combined["defense_rush_rating"] = (
+            combined["league_rush_per_att"] - combined["allowed_rush_per_att"]
+        )
+        combined["defense_pass_rating"] = (
+            combined["league_pass_per_att"] - combined["allowed_pass_per_att"]
+        )
 
-        cols = ["season", "week", "team", "offense_pass_rating", "offense_rush_rating", "defense_pass_rating", "defense_rush_rating"]
+        ratings = combined[
+            [
+                "season",
+                "week",
+                "team",
+                "offense_pass_rating",
+                "offense_rush_rating",
+                "defense_pass_rating",
+                "defense_rush_rating",
+            ]
+        ].sort_values(["team", "season", "week"]).reset_index(drop=True)
 
-        return grouped[cols]
+        rating_cols = [
+            "offense_pass_rating",
+            "offense_rush_rating",
+            "defense_pass_rating",
+            "defense_rush_rating",
+        ]
+        ratings[rating_cols] = ratings[rating_cols].fillna(0)
+
+        return ratings
 
     def _compute_contextual_averages(self, player_stats: pd.DataFrame) -> pd.DataFrame:
         if player_stats.empty:
