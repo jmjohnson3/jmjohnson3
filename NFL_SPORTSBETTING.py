@@ -1460,6 +1460,42 @@ class FeatureBuilder:
         latest_players["team"] = latest_players["team"].apply(normalize_team_abbr)
         latest_players = latest_players[latest_players["team"].notna()]
 
+        season_source = self.player_feature_frame.copy()
+        season_source["team"] = season_source["team"].apply(normalize_team_abbr)
+        season_source = season_source[season_source["team"].isin(TEAM_ABBR_CANONICAL.keys())]
+
+        if not season_source.empty:
+            aggregate_candidates = [
+                "passing_attempts",
+                "passing_yards",
+                "passing_tds",
+                "rushing_attempts",
+                "rushing_yards",
+                "rushing_tds",
+                "receiving_targets",
+                "receiving_yards",
+                "receptions",
+                "receiving_tds",
+                "fantasy_points",
+                "snap_count",
+            ]
+            present_metrics = [
+                col for col in aggregate_candidates if col in season_source.columns
+            ]
+            if present_metrics:
+                season_totals = (
+                    season_source.groupby(["player_id", "team"], as_index=False)[
+                        present_metrics
+                    ].sum(min_count=1)
+                )
+                rename_map = {col: f"season_{col}" for col in present_metrics}
+                season_totals = season_totals.rename(columns=rename_map)
+                latest_players = latest_players.merge(
+                    season_totals,
+                    on=["player_id", "team"],
+                    how="left",
+                )
+
         games = upcoming_games.copy()
         games["start_time"] = pd.to_datetime(games["start_time"], utc=True, errors="coerce")
         games = games[games["start_time"].notna()]
@@ -1519,6 +1555,10 @@ class FeatureBuilder:
 
                     if pos_key == "QB":
                         sort_cols = [
+                            "season_passing_attempts",
+                            "season_passing_yards",
+                            "season_fantasy_points",
+                            "season_snap_count",
                             "passing_attempts",
                             "passing_yards",
                             "fantasy_points",
@@ -1526,6 +1566,11 @@ class FeatureBuilder:
                         ]
                     elif pos_key == "RB":
                         sort_cols = [
+                            "season_rushing_attempts",
+                            "season_rushing_yards",
+                            "season_receiving_targets",
+                            "season_snap_count",
+                            "season_fantasy_points",
                             "rushing_attempts",
                             "rushing_yards",
                             "receiving_targets",
@@ -1534,6 +1579,10 @@ class FeatureBuilder:
                         ]
                     elif pos_key == "WR":
                         sort_cols = [
+                            "season_receiving_targets",
+                            "season_receiving_yards",
+                            "season_receptions",
+                            "season_fantasy_points",
                             "receiving_targets",
                             "receiving_yards",
                             "receptions",
@@ -1541,13 +1590,22 @@ class FeatureBuilder:
                         ]
                     elif pos_key == "TE":
                         sort_cols = [
+                            "season_receiving_targets",
+                            "season_receptions",
+                            "season_receiving_yards",
+                            "season_fantasy_points",
                             "receiving_targets",
                             "receptions",
                             "receiving_yards",
                             "fantasy_points",
                         ]
                     else:
-                        sort_cols = ["snap_count", "fantasy_points"]
+                        sort_cols = [
+                            "season_snap_count",
+                            "season_fantasy_points",
+                            "snap_count",
+                            "fantasy_points",
+                        ]
 
                     for col in sort_cols:
                         if col not in position_candidates.columns:
