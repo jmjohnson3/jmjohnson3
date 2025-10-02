@@ -31,7 +31,14 @@ from requests import HTTPError
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score,
+    log_loss,
+    mean_absolute_error,
+    mean_squared_error,
+    roc_auc_score,
+)
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sqlalchemy import (
@@ -1352,6 +1359,49 @@ class ModelTrainer:
         self.engine = engine
         self.feature_builder = FeatureBuilder(engine)
 
+    def _sort_by_time(self, df: pd.DataFrame) -> pd.DataFrame:
+        if "start_time" in df.columns:
+            return df.sort_values("start_time")
+        if {"season", "week"}.issubset(df.columns):
+            return df.sort_values(["season", "week"])
+        if "week" in df.columns:
+            return df.sort_values("week")
+        return df.sort_index()
+
+    def _chronological_split(
+        self, df: pd.DataFrame, holdout_fraction: float = 0.2
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        df_sorted = self._sort_by_time(df).reset_index(drop=True)
+        if len(df_sorted) < 5:
+            split_index = max(1, len(df_sorted) - 1)
+        else:
+            holdout_size = max(1, int(len(df_sorted) * holdout_fraction))
+            if holdout_size >= len(df_sorted):
+                holdout_size = max(1, len(df_sorted) - 1)
+            split_index = len(df_sorted) - holdout_size
+        if split_index <= 0 or split_index >= len(df_sorted):
+            split_index = max(1, len(df_sorted) - 1)
+        train_df = df_sorted.iloc[:split_index]
+        test_df = df_sorted.iloc[split_index:]
+        return train_df, test_df, df_sorted
+
+    def _build_time_series_cv(self, n_samples: int) -> TimeSeriesSplit:
+        if n_samples < 3:
+            raise ValueError("At least 3 samples are required for time series CV.")
+        n_splits = min(5, max(2, n_samples - 1))
+        if n_splits >= n_samples:
+            n_splits = n_samples - 1
+        return TimeSeriesSplit(n_splits=n_splits)
+
+    @staticmethod
+    def _gb_param_grid(prefix: str) -> Dict[str, List[Any]]:
+        return {
+            f"{prefix}learning_rate": [0.01, 0.05, 0.1, 0.2],
+            f"{prefix}n_estimators": [100, 200, 300, 400],
+            f"{prefix}max_depth": [2, 3, 4],
+            f"{prefix}subsample": [0.6, 0.8, 1.0],
+        }
+
     def train(self) -> Dict[str, Pipeline]:
         datasets = self.feature_builder.build_features()
         models: Dict[str, Pipeline] = {}
@@ -1435,8 +1485,12 @@ class ModelTrainer:
             return None
 
         feature_columns = available_numeric + available_categorical
-        X = df[feature_columns]
-        y = df[target]
+
+        train_df, test_df, sorted_df = self._chronological_split(df)
+        X_train = train_df[feature_columns]
+        y_train = train_df[target]
+        X_test = test_df[feature_columns]
+        y_test = test_df[target]
 
         transformers = []
         if available_numeric:
@@ -1469,11 +1523,51 @@ class ModelTrainer:
             ("regressor", GradientBoostingRegressor(random_state=42)),
         ])
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        model.fit(X_train, y_train)
-        score = model.score(X_test, y_test)
-        logging.info("Trained %s model, R^2=%.3f on holdout", target, score)
-        return model
+        try:
+            cv = self._build_time_series_cv(len(X_train))
+        except ValueError as exc:
+            logging.warning(
+                "Skipping hyperparameter tuning for %s due to insufficient data: %s",
+                target,
+                exc,
+            )
+            model.fit(X_train, y_train)
+            score = model.score(X_test, y_test)
+            logging.info("Trained %s model without tuning, R^2=%.3f", target, score)
+            return model
+
+        search = RandomizedSearchCV(
+            estimator=model,
+            param_distributions=self._gb_param_grid("regressor__"),
+            n_iter=10,
+            scoring="neg_mean_absolute_error",
+            cv=cv,
+            random_state=42,
+            n_jobs=-1,
+        )
+        search.fit(X_train, y_train)
+        best_model: Pipeline = search.best_estimator_
+        logging.info(
+            "Best parameters for %s model: %s (CV MAE=%.3f)",
+            target,
+            search.best_params_,
+            -search.best_score_,
+        )
+
+        y_pred = best_model.predict(X_test)
+        r2 = best_model.score(X_test, y_test)
+        mae = mean_absolute_error(y_test, y_pred)
+        rmse = mean_squared_error(y_test, y_pred, squared=False)
+        logging.info(
+            "%s holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
+            target,
+            r2,
+            mae,
+            rmse,
+        )
+
+        best_model.fit(sorted_df[feature_columns], sorted_df[target])
+        return best_model
 
     def _train_game_models(self, df: pd.DataFrame) -> Dict[str, Pipeline]:
         if len(df) < 20 or df["game_result"].nunique() <= 1:
@@ -1549,10 +1643,18 @@ class ModelTrainer:
 
         feature_columns = available_numeric + available_categorical
 
-        X = df[feature_columns]
-        y_winner = (df["game_result"] == "home").astype(int)
-        y_home_score = df["home_score"]
-        y_away_score = df["away_score"]
+        train_df, test_df, sorted_df = self._chronological_split(df)
+        X_train = train_df[feature_columns]
+        X_test = test_df[feature_columns]
+
+        y_winner_train = (train_df["game_result"] == "home").astype(int)
+        y_winner_test = (test_df["game_result"] == "home").astype(int)
+
+        y_home_train = train_df["home_score"]
+        y_home_test = test_df["home_score"]
+
+        y_away_train = train_df["away_score"]
+        y_away_test = test_df["away_score"]
 
         transformers = []
         if available_numeric:
@@ -1592,19 +1694,116 @@ class ModelTrainer:
             ("preprocessor", preprocessor),
             ("regressor", GradientBoostingRegressor(random_state=42)),
         ])
+        try:
+            cv = self._build_time_series_cv(len(X_train))
+        except ValueError as exc:
+            logging.warning(
+                "Skipping hyperparameter tuning for game models due to insufficient data: %s",
+                exc,
+            )
+            clf.fit(X_train, y_winner_train)
+            reg_home.fit(X_train, y_home_train)
+            reg_away.fit(X_train, y_away_train)
+        else:
+            clf_search = RandomizedSearchCV(
+                estimator=clf,
+                param_distributions=self._gb_param_grid("classifier__"),
+                n_iter=10,
+                scoring="roc_auc",
+                cv=cv,
+                random_state=42,
+                n_jobs=-1,
+            )
+            clf_search.fit(X_train, y_winner_train)
+            clf = clf_search.best_estimator_
+            logging.info(
+                "Best parameters for game winner model: %s (CV ROC-AUC=%.3f)",
+                clf_search.best_params_,
+                clf_search.best_score_,
+            )
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y_winner, test_size=0.2, random_state=42)
-        clf.fit(X_train, y_train)
-        clf_score = clf.score(X_test, y_test)
-        logging.info("Trained game outcome classifier, accuracy=%.3f", clf_score)
+            reg_home_search = RandomizedSearchCV(
+                estimator=reg_home,
+                param_distributions=self._gb_param_grid("regressor__"),
+                n_iter=10,
+                scoring="neg_mean_absolute_error",
+                cv=cv,
+                random_state=42,
+                n_jobs=-1,
+            )
+            reg_home_search.fit(X_train, y_home_train)
+            reg_home = reg_home_search.best_estimator_
+            logging.info(
+                "Best parameters for home score model: %s (CV MAE=%.3f)",
+                reg_home_search.best_params_,
+                -reg_home_search.best_score_,
+            )
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y_home_score, test_size=0.2, random_state=42)
-        reg_home.fit(X_train, y_train)
-        logging.info("Trained home score regressor, R^2=%.3f", reg_home.score(X_test, y_test))
+            reg_away_search = RandomizedSearchCV(
+                estimator=reg_away,
+                param_distributions=self._gb_param_grid("regressor__"),
+                n_iter=10,
+                scoring="neg_mean_absolute_error",
+                cv=cv,
+                random_state=42,
+                n_jobs=-1,
+            )
+            reg_away_search.fit(X_train, y_away_train)
+            reg_away = reg_away_search.best_estimator_
+            logging.info(
+                "Best parameters for away score model: %s (CV MAE=%.3f)",
+                reg_away_search.best_params_,
+                -reg_away_search.best_score_,
+            )
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y_away_score, test_size=0.2, random_state=42)
-        reg_away.fit(X_train, y_train)
-        logging.info("Trained away score regressor, R^2=%.3f", reg_away.score(X_test, y_test))
+        winner_pred = clf.predict(X_test)
+        winner_proba = clf.predict_proba(X_test)[:, 1]
+        winner_accuracy = accuracy_score(y_winner_test, winner_pred)
+        try:
+            winner_roc_auc = (
+                roc_auc_score(y_winner_test, winner_proba)
+                if len(np.unique(y_winner_test)) > 1
+                else float("nan")
+            )
+        except ValueError:
+            winner_roc_auc = float("nan")
+        try:
+            winner_log_loss = log_loss(y_winner_test, winner_proba, labels=[0, 1])
+        except ValueError:
+            winner_log_loss = float("nan")
+        logging.info(
+            "Game winner holdout metrics | accuracy=%.3f | ROC-AUC=%s | log_loss=%s",
+            winner_accuracy,
+            f"{winner_roc_auc:.3f}" if not np.isnan(winner_roc_auc) else "nan",
+            f"{winner_log_loss:.3f}" if not np.isnan(winner_log_loss) else "nan",
+        )
+
+        home_pred = reg_home.predict(X_test)
+        home_r2 = reg_home.score(X_test, y_home_test)
+        home_mae = mean_absolute_error(y_home_test, home_pred)
+        home_rmse = mean_squared_error(y_home_test, home_pred, squared=False)
+        logging.info(
+            "Home score holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
+            home_r2,
+            home_mae,
+            home_rmse,
+        )
+
+        away_pred = reg_away.predict(X_test)
+        away_r2 = reg_away.score(X_test, y_away_test)
+        away_mae = mean_absolute_error(y_away_test, away_pred)
+        away_rmse = mean_squared_error(y_away_test, away_pred, squared=False)
+        logging.info(
+            "Away score holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
+            away_r2,
+            away_mae,
+            away_rmse,
+        )
+
+        X_full = sorted_df[feature_columns]
+        clf.fit(X_full, (sorted_df["game_result"] == "home").astype(int))
+        reg_home.fit(X_full, sorted_df["home_score"])
+        reg_away.fit(X_full, sorted_df["away_score"])
 
         return {
             "game_winner": clf,
