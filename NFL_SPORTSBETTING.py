@@ -75,19 +75,6 @@ NFL_SPORT_KEY = "americanfootball_nfl"
 ODDS_REGIONS = ["us"]
 ODDS_FORMAT = "american"
 
-# Shared categorical weather-related feature candidates. Only the columns
-# present in a given dataset will be used downstream.
-WEATHER_CATEGORICAL_FEATURES = [
-    "weather_conditions",
-    "is_precip",
-    "is_windy",
-    "has_precip",
-    "has_precipitation",
-    "has_wind",
-    "precip_flag",
-    "wind_flag",
-]
-
 DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # ---------------------------------------------------------------------------
@@ -811,6 +798,16 @@ class FeatureBuilder:
 
     def __init__(self, engine: Engine):
         self.engine = engine
+        self.games_frame: Optional[pd.DataFrame] = None
+        self.player_feature_frame: Optional[pd.DataFrame] = None
+        self.team_strength_frame: Optional[pd.DataFrame] = None
+        self.team_strength_latest_by_season: Optional[pd.DataFrame] = None
+        self.team_strength_latest_overall: Optional[pd.DataFrame] = None
+        self.team_history_frame: Optional[pd.DataFrame] = None
+        self.team_history_latest_by_season: Optional[pd.DataFrame] = None
+        self.team_history_latest_overall: Optional[pd.DataFrame] = None
+        self.context_feature_frame: Optional[pd.DataFrame] = None
+
 
     def load_dataframes(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         games = pd.read_sql_table("nfl_games", self.engine)
@@ -835,6 +832,7 @@ class FeatureBuilder:
 
         games = games.copy()
         player_stats = player_stats.copy()
+        self.games_frame = games
 
         # Basic cleanup
         games["start_time"] = pd.to_datetime(games["start_time"])
@@ -848,6 +846,20 @@ class FeatureBuilder:
 
         # Derive rolling scoring, rest, and win-rate indicators from historical games.
         team_game_history = self._compute_team_game_rolling_stats(games)
+        self.team_history_frame = team_game_history
+        if not team_game_history.empty:
+            history_sorted = team_game_history.sort_values(["team", "season", "start_time"])
+            self.team_history_latest_by_season = history_sorted.drop_duplicates(
+                subset=["team", "season"], keep="last"
+            )
+            self.team_history_latest_overall = history_sorted.drop_duplicates(
+                subset=["team"], keep="last"
+            )
+        else:
+            empty_history = team_game_history.iloc[0:0]
+            self.team_history_latest_by_season = empty_history
+            self.team_history_latest_overall = empty_history
+
 
         datasets: Dict[str, pd.DataFrame] = {}
         team_strength: pd.DataFrame
@@ -857,8 +869,9 @@ class FeatureBuilder:
                 "Player statistics table is empty. Player-level models will not be trained."
             )
             team_strength = self._compute_team_unit_strength(player_stats)
+            self.team_strength_frame = team_strength
         else:
-            base_enrichment_columns = [
+            enrichment_columns = [
                 "game_id",
                 "season",
                 "week",
@@ -868,16 +881,11 @@ class FeatureBuilder:
                 "state",
                 "day_of_week",
                 "referee",
+                "weather_conditions",
                 "temperature_f",
                 "home_team",
                 "away_team",
             ]
-            enrichment_columns = [
-                col for col in base_enrichment_columns if col in games.columns
-            ]
-            for col in WEATHER_CATEGORICAL_FEATURES:
-                if col in games.columns and col not in enrichment_columns:
-                    enrichment_columns.append(col)
             player_stats = player_stats.merge(
                 games[enrichment_columns],
                 on="game_id",
@@ -937,13 +945,6 @@ class FeatureBuilder:
                         "Skipping %s dataset because no rows remained after filtering", target
                     )
                     return
-                sort_columns = [
-                    col
-                    for col in ["season", "week", "start_time"]
-                    if col in subset.columns
-                ]
-                if sort_columns:
-                    subset = subset.sort_values(sort_columns).reset_index(drop=True)
                 datasets[target] = subset
 
             add_dataset("rushing_yards", ["RB", "HB", "FB", "QB"])
@@ -953,6 +954,40 @@ class FeatureBuilder:
             add_dataset("receiving_tds", ["WR", "RB", "TE"])
             add_dataset("passing_tds", ["QB"])
 
+        if self.team_strength_frame is None:
+            self.team_strength_frame = team_strength
+        if self.team_strength_frame is not None and not self.team_strength_frame.empty:
+            sorted_strength = self.team_strength_frame.sort_values(["team", "season", "week"])
+            self.team_strength_latest_by_season = sorted_strength.drop_duplicates(
+                subset=["team", "season"], keep="last"
+            )
+            self.team_strength_latest_overall = sorted_strength.drop_duplicates(
+                subset=["team"], keep="last"
+            )
+        else:
+            empty_strength = team_strength.iloc[0:0]
+            self.team_strength_latest_by_season = empty_strength
+            self.team_strength_latest_overall = empty_strength
+
+        if self.context_feature_frame is None:
+            self.context_feature_frame = pd.DataFrame(
+                columns=[
+                    "team",
+                    "venue",
+                    "day_of_week",
+                    "referee",
+                    "avg_rush_yards",
+                    "avg_rec_yards",
+                    "avg_receptions",
+                    "avg_rush_tds",
+                    "avg_rec_tds",
+                ]
+            )
+
+        if player_stats.empty:
+            self.player_feature_frame = pd.DataFrame(columns=player_stats.columns)
+        else:
+            self.player_feature_frame = player_stats
         home_strength = team_strength.rename(
             columns={
                 "team": "home_team",
@@ -1036,16 +1071,285 @@ class FeatureBuilder:
                 "No completed games with scores available. Game outcome model will be skipped."
             )
         else:
-            sort_columns = [
-                col
-                for col in ["season", "week", "start_time"]
-                if col in games_labeled.columns
-            ]
-            if sort_columns:
-                games_labeled = games_labeled.sort_values(sort_columns).reset_index(drop=True)
             datasets["game_outcome"] = games_labeled
 
         return datasets
+
+    # ------------------------------------------------------------------
+    # Upcoming feature preparation
+    # ------------------------------------------------------------------
+
+    def _get_latest_team_strength(self, team: str, season: Optional[str]) -> Optional[pd.Series]:
+        if self.team_strength_latest_by_season is not None and not self.team_strength_latest_by_season.empty:
+            if season:
+                match = self.team_strength_latest_by_season[
+                    (self.team_strength_latest_by_season["team"] == team)
+                    & (self.team_strength_latest_by_season["season"] == season)
+                ]
+                if not match.empty:
+                    return match.iloc[0]
+        if self.team_strength_latest_overall is not None and not self.team_strength_latest_overall.empty:
+            match = self.team_strength_latest_overall[
+                self.team_strength_latest_overall["team"] == team
+            ]
+            if not match.empty:
+                return match.iloc[0]
+        return None
+
+    def _get_latest_team_history(self, team: str, season: Optional[str]) -> Optional[pd.Series]:
+        if self.team_history_latest_by_season is not None and not self.team_history_latest_by_season.empty:
+            if season:
+                match = self.team_history_latest_by_season[
+                    (self.team_history_latest_by_season["team"] == team)
+                    & (self.team_history_latest_by_season["season"] == season)
+                ]
+                if not match.empty:
+                    return match.iloc[0]
+        if self.team_history_latest_overall is not None and not self.team_history_latest_overall.empty:
+            match = self.team_history_latest_overall[
+                self.team_history_latest_overall["team"] == team
+            ]
+            if not match.empty:
+                return match.iloc[0]
+        return None
+
+    def prepare_upcoming_game_features(self, upcoming_games: pd.DataFrame) -> pd.DataFrame:
+        if upcoming_games.empty:
+            return upcoming_games.copy()
+
+        features = upcoming_games.copy()
+        features["start_time"] = pd.to_datetime(features["start_time"])
+        if "day_of_week" not in features.columns or features["day_of_week"].isna().any():
+            features["day_of_week"] = features["start_time"].dt.day_name()
+
+        numeric_placeholders = {
+            "home_offense_pass_rating": np.nan,
+            "home_offense_rush_rating": np.nan,
+            "home_defense_pass_rating": np.nan,
+            "home_defense_rush_rating": np.nan,
+            "away_offense_pass_rating": np.nan,
+            "away_offense_rush_rating": np.nan,
+            "away_defense_pass_rating": np.nan,
+            "away_defense_rush_rating": np.nan,
+            "home_points_for_avg": np.nan,
+            "home_points_against_avg": np.nan,
+            "home_point_diff_avg": np.nan,
+            "home_win_pct_recent": np.nan,
+            "home_prev_points_for": np.nan,
+            "home_prev_points_against": np.nan,
+            "home_prev_point_diff": np.nan,
+            "home_rest_days": np.nan,
+            "away_points_for_avg": np.nan,
+            "away_points_against_avg": np.nan,
+            "away_point_diff_avg": np.nan,
+            "away_win_pct_recent": np.nan,
+            "away_prev_points_for": np.nan,
+            "away_prev_points_against": np.nan,
+            "away_prev_point_diff": np.nan,
+            "away_rest_days": np.nan,
+        }
+        for col, default in numeric_placeholders.items():
+            if col not in features.columns:
+                features[col] = default
+
+        for idx, row in features.iterrows():
+            season = row.get("season")
+            home_team = row.get("home_team")
+            away_team = row.get("away_team")
+
+            if home_team:
+                strength = self._get_latest_team_strength(home_team, season)
+                if strength is not None:
+                    features.at[idx, "home_offense_pass_rating"] = strength.get("offense_pass_rating")
+                    features.at[idx, "home_offense_rush_rating"] = strength.get("offense_rush_rating")
+                    features.at[idx, "home_defense_pass_rating"] = strength.get("defense_pass_rating")
+                    features.at[idx, "home_defense_rush_rating"] = strength.get("defense_rush_rating")
+                history = self._get_latest_team_history(home_team, season)
+                if history is not None:
+                    features.at[idx, "home_points_for_avg"] = history.get("rolling_points_for")
+                    features.at[idx, "home_points_against_avg"] = history.get("rolling_points_against")
+                    features.at[idx, "home_point_diff_avg"] = history.get("rolling_point_diff")
+                    features.at[idx, "home_win_pct_recent"] = history.get("rolling_win_pct")
+                    features.at[idx, "home_prev_points_for"] = history.get("prev_points_for")
+                    features.at[idx, "home_prev_points_against"] = history.get("prev_points_against")
+                    features.at[idx, "home_prev_point_diff"] = history.get("prev_point_diff")
+                    features.at[idx, "home_rest_days"] = history.get("rest_days")
+
+            if away_team:
+                strength = self._get_latest_team_strength(away_team, season)
+                if strength is not None:
+                    features.at[idx, "away_offense_pass_rating"] = strength.get("offense_pass_rating")
+                    features.at[idx, "away_offense_rush_rating"] = strength.get("offense_rush_rating")
+                    features.at[idx, "away_defense_pass_rating"] = strength.get("defense_pass_rating")
+                    features.at[idx, "away_defense_rush_rating"] = strength.get("defense_rush_rating")
+                history = self._get_latest_team_history(away_team, season)
+                if history is not None:
+                    features.at[idx, "away_points_for_avg"] = history.get("rolling_points_for")
+                    features.at[idx, "away_points_against_avg"] = history.get("rolling_points_against")
+                    features.at[idx, "away_point_diff_avg"] = history.get("rolling_point_diff")
+                    features.at[idx, "away_win_pct_recent"] = history.get("rolling_win_pct")
+                    features.at[idx, "away_prev_points_for"] = history.get("prev_points_for")
+                    features.at[idx, "away_prev_points_against"] = history.get("prev_points_against")
+                    features.at[idx, "away_prev_point_diff"] = history.get("prev_point_diff")
+                    features.at[idx, "away_rest_days"] = history.get("rest_days")
+
+        features["moneyline_diff"] = features["home_moneyline"] - features["away_moneyline"]
+        features["implied_prob_diff"] = features["home_implied_prob"] - features["away_implied_prob"]
+        features["implied_prob_sum"] = features["home_implied_prob"] + features["away_implied_prob"]
+
+        return features
+
+    def prepare_upcoming_player_features(
+        self,
+        upcoming_games: pd.DataFrame,
+        starters_per_position: Optional[Dict[str, int]] = None,
+    ) -> pd.DataFrame:
+        if (
+            self.player_feature_frame is None
+            or self.player_feature_frame.empty
+            or upcoming_games.empty
+        ):
+            return pd.DataFrame()
+
+        if starters_per_position is None:
+            starters_per_position = {"QB": 1, "RB": 2, "WR": 3, "TE": 1}
+
+        position_groups = {
+            "QB": {"QB"},
+            "RB": {"RB", "HB", "FB"},
+            "WR": {"WR"},
+            "TE": {"TE"},
+        }
+
+        latest_players = (
+            self.player_feature_frame.sort_values("start_time")
+            .groupby("player_id", as_index=False)
+            .tail(1)
+        )
+        latest_players = latest_players[latest_players["team"].notna()]
+
+        games = upcoming_games.copy()
+        games["start_time"] = pd.to_datetime(games["start_time"])
+        games["day_of_week"] = games["start_time"].dt.day_name()
+
+        selected_rows: List[pd.Series] = []
+
+        for game in games.itertuples():
+            game_id = getattr(game, "game_id")
+            season = getattr(game, "season", None)
+            week = getattr(game, "week", None)
+            start_time = getattr(game, "start_time")
+            venue = getattr(game, "venue", None)
+            city = getattr(game, "city", None)
+            state = getattr(game, "state", None)
+            day_of_week = getattr(game, "day_of_week", None)
+            referee = getattr(game, "referee", None)
+            weather = getattr(game, "weather_conditions", None)
+            temperature = getattr(game, "temperature_f", None)
+            home_team = getattr(game, "home_team", None)
+            away_team = getattr(game, "away_team", None)
+
+            for team, opponent in ((away_team, home_team), (home_team, away_team)):
+                if not team or not opponent:
+                    continue
+
+                candidates = latest_players[latest_players["team"] == team]
+                if candidates.empty:
+                    continue
+
+                chosen_players: List[pd.Series] = []
+                used_player_ids: set[str] = set()
+
+                for pos_key, count in starters_per_position.items():
+                    allowed_positions = position_groups.get(pos_key, {pos_key})
+                    position_candidates = candidates[candidates["position"].isin(allowed_positions)]
+                    if position_candidates.empty:
+                        continue
+                    position_candidates = position_candidates.sort_values(
+                        ["snap_count", "fantasy_points"], ascending=[False, False]
+                    )
+                    pos_selected = 0
+                    for _, player_row in position_candidates.iterrows():
+                        player_id = player_row.get("player_id")
+                        if player_id in used_player_ids:
+                            continue
+                        chosen_players.append(player_row)
+                        used_player_ids.add(player_id)
+                        pos_selected += 1
+                        if pos_selected >= count:
+                            break
+
+                if not chosen_players:
+                    continue
+
+                for player_row in chosen_players:
+                    row_copy = player_row.copy()
+                    row_copy["game_id"] = game_id
+                    row_copy["season"] = season
+                    row_copy["week"] = week
+                    row_copy["start_time"] = start_time
+                    row_copy["venue"] = venue
+                    row_copy["city"] = city
+                    row_copy["state"] = state
+                    row_copy["day_of_week"] = day_of_week
+                    row_copy["referee"] = referee
+                    row_copy["weather_conditions"] = weather
+                    row_copy["temperature_f"] = temperature
+                    row_copy["home_team"] = home_team
+                    row_copy["away_team"] = away_team
+                    row_copy["opponent"] = opponent
+
+                    strength = self._get_latest_team_strength(team, season)
+                    if strength is not None:
+                        row_copy["offense_pass_rating"] = strength.get("offense_pass_rating")
+                        row_copy["offense_rush_rating"] = strength.get("offense_rush_rating")
+                        row_copy["defense_pass_rating"] = strength.get("defense_pass_rating")
+                        row_copy["defense_rush_rating"] = strength.get("defense_rush_rating")
+
+                    opp_strength = self._get_latest_team_strength(opponent, season)
+                    if opp_strength is not None:
+                        row_copy["opp_offense_pass_rating"] = opp_strength.get("offense_pass_rating")
+                        row_copy["opp_offense_rush_rating"] = opp_strength.get("offense_rush_rating")
+                        row_copy["opp_defense_pass_rating"] = opp_strength.get("defense_pass_rating")
+                        row_copy["opp_defense_rush_rating"] = opp_strength.get("defense_rush_rating")
+
+                    selected_rows.append(row_copy)
+
+        if not selected_rows:
+            return pd.DataFrame()
+
+        player_features = pd.DataFrame(selected_rows)
+
+        # Merge contextual averages for updated venue/day/ref when available.
+        if self.context_feature_frame is not None and not self.context_feature_frame.empty:
+            contextual = self.context_feature_frame.rename(
+                columns={
+                    "avg_rush_yards": "avg_rush_yards_ctx",
+                    "avg_rec_yards": "avg_rec_yards_ctx",
+                    "avg_receptions": "avg_receptions_ctx",
+                    "avg_rush_tds": "avg_rush_tds_ctx",
+                    "avg_rec_tds": "avg_rec_tds_ctx",
+                }
+            )
+            player_features = player_features.merge(
+                contextual,
+                on=["team", "venue", "day_of_week", "referee"],
+                how="left",
+            )
+            for src, dest in [
+                ("avg_rush_yards_ctx", "avg_rush_yards"),
+                ("avg_rec_yards_ctx", "avg_rec_yards"),
+                ("avg_receptions_ctx", "avg_receptions"),
+                ("avg_rush_tds_ctx", "avg_rush_tds"),
+                ("avg_rec_tds_ctx", "avg_rec_tds"),
+            ]:
+                if src in player_features.columns:
+                    player_features[dest] = player_features[dest].where(
+                        player_features[dest].notna(), player_features[src]
+                    )
+                    player_features = player_features.drop(columns=[src])
+
+        return player_features
 
     def _compute_team_unit_strength(self, player_stats: pd.DataFrame) -> pd.DataFrame:
         if player_stats.empty:
@@ -1133,6 +1437,8 @@ class FeatureBuilder:
             return pd.DataFrame(
                 columns=[
                     "game_id",
+                    "season",
+                    "start_time",
                     "team",
                     "is_home",
                     "rolling_points_for",
@@ -1244,6 +1550,8 @@ class FeatureBuilder:
         return team_games[
             [
                 "game_id",
+                "season",
+                "start_time",
                 "team",
                 "is_home",
                 "rolling_points_for",
@@ -1281,43 +1589,35 @@ class ModelTrainer:
             return df.sort_values("week")
         return df.sort_index()
 
-    def _time_series_holdout_split(
+    def _chronological_split(
         self,
         df: pd.DataFrame,
+        holdout_fraction: float = 0.2,
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         df_sorted = self._sort_by_time(df).reset_index(drop=True)
-        n_samples = len(df_sorted)
+        if len(df_sorted) < 5:
+            split_index = max(1, len(df_sorted) - 1)
+        else:
+            holdout_size = max(1, int(len(df_sorted) * holdout_fraction))
+            if holdout_size >= len(df_sorted):
+                holdout_size = max(1, len(df_sorted) - 1)
+            split_index = len(df_sorted) - holdout_size
 
-        if n_samples <= 2:
-            split_index = max(1, n_samples - 1)
-            train_df = df_sorted.iloc[:split_index]
-            test_df = df_sorted.iloc[split_index:]
-            return train_df, test_df, df_sorted
+        if split_index <= 0 or split_index >= len(df_sorted):
+            split_index = max(1, len(df_sorted) - 1)
 
-        n_splits = min(5, n_samples - 1)
-        tscv = TimeSeriesSplit(n_splits=n_splits)
+        train_df = df_sorted.iloc[:split_index]
+        test_df = df_sorted.iloc[split_index:]
 
-        final_train_idx: Optional[np.ndarray] = None
-        final_val_idx: Optional[np.ndarray] = None
-        for train_idx, val_idx in tscv.split(df_sorted):
-            final_train_idx, final_val_idx = train_idx, val_idx
-
-        if final_train_idx is None or final_val_idx is None:
-            split_index = max(1, n_samples - 1)
-            train_df = df_sorted.iloc[:split_index]
-            test_df = df_sorted.iloc[split_index:]
-            return train_df, test_df, df_sorted
-
-        train_df = df_sorted.iloc[final_train_idx]
-        test_df = df_sorted.iloc[final_val_idx]
         return train_df, test_df, df_sorted
 
     def _build_time_series_cv(self, n_samples: int) -> TimeSeriesSplit:
         if n_samples < 3:
             raise ValueError("At least 3 samples are required for time series CV.")
-        n_splits = min(5, n_samples - 1)
-        if n_splits < 2:
-            raise ValueError("Unable to build CV folds with fewer than 3 samples.")
+        n_splits = min(5, max(2, n_samples - 1))
+        if n_splits >= n_samples:
+            n_splits = n_samples - 1
+
         return TimeSeriesSplit(n_splits=n_splits)
 
     @staticmethod
@@ -1382,7 +1682,7 @@ class ModelTrainer:
             "day_of_week",
             "referee",
             "position",
-        ] + WEATHER_CATEGORICAL_FEATURES
+        ]
 
         available_numeric = [
             col for col in numeric_features if col in df.columns and df[col].notna().any()
@@ -1413,14 +1713,13 @@ class ModelTrainer:
             )
             return None
 
-        feature_columns = available_numeric + available_categorical
+        feature_columns = list(available_numeric + available_categorical)
 
-        train_df, test_df, sorted_df = self._time_series_holdout_split(df)
+        train_df, test_df, sorted_df = self._chronological_split(df)
         X_train = train_df[feature_columns]
         y_train = train_df[target]
         X_test = test_df[feature_columns]
         y_test = test_df[target]
-        n_train, n_val = len(train_df), len(test_df)
 
         transformers = []
         if available_numeric:
@@ -1454,15 +1753,16 @@ class ModelTrainer:
         ])
 
         model.fit(X_train, y_train)
+        setattr(model, "feature_columns", feature_columns)
+        setattr(model, "target_name", target)
+
         baseline_pred = model.predict(X_test)
         baseline_r2 = model.score(X_test, y_test)
         baseline_mae = mean_absolute_error(y_test, baseline_pred)
         baseline_rmse = float(np.sqrt(mean_squared_error(y_test, baseline_pred)))
         logging.info(
-            "%s baseline final-fold metrics | train=%d | val=%d | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
+            "Trained %s model (baseline GBM), R^2=%.3f on holdout (MAE=%.3f, RMSE=%.3f)",
             target,
-            n_train,
-            n_val,
             baseline_r2,
             baseline_mae,
             baseline_rmse,
@@ -1501,16 +1801,16 @@ class ModelTrainer:
         mae = mean_absolute_error(y_test, y_pred)
         rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
         logging.info(
-            "%s tuned final-fold metrics | train=%d | val=%d | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
+            "%s holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
             target,
-            n_train,
-            n_val,
             r2,
             mae,
             rmse,
         )
 
         best_model.fit(sorted_df[feature_columns], sorted_df[target])
+        setattr(best_model, "feature_columns", feature_columns)
+        setattr(best_model, "target_name", target)
         return best_model
 
     def _train_game_models(self, df: pd.DataFrame) -> Dict[str, Pipeline]:
@@ -1556,13 +1856,7 @@ class ModelTrainer:
             "away_prev_point_diff",
             "away_rest_days",
         ]
-        categorical_features = [
-            "venue",
-            "day_of_week",
-            "referee",
-            "home_team",
-            "away_team",
-        ] + WEATHER_CATEGORICAL_FEATURES
+        categorical_features = ["venue", "day_of_week", "referee", "home_team", "away_team"]
 
         available_numeric = [
             col for col in numeric_features if col in df.columns and df[col].notna().any()
@@ -1590,11 +1884,12 @@ class ModelTrainer:
             )
             return {}
 
-        feature_columns = available_numeric + available_categorical
-        train_df, test_df, sorted_df = self._time_series_holdout_split(df)
+        feature_columns = list(available_numeric + available_categorical)
+
+        train_df, test_df, sorted_df = self._chronological_split(df)
         X_train = train_df[feature_columns]
         X_test = test_df[feature_columns]
-        n_train, n_val = len(train_df), len(test_df)
+
 
         y_winner_train = (train_df["game_result"] == "home").astype(int)
         y_winner_test = (test_df["game_result"] == "home").astype(int)
@@ -1647,26 +1942,24 @@ class ModelTrainer:
         clf.fit(X_train, y_winner_train)
         reg_home.fit(X_train, y_home_train)
         reg_away.fit(X_train, y_away_train)
+        setattr(clf, "feature_columns", feature_columns)
+        setattr(reg_home, "feature_columns", feature_columns)
+        setattr(reg_away, "feature_columns", feature_columns)
+
 
         baseline_winner_acc = clf.score(X_test, y_winner_test)
         baseline_home_r2 = reg_home.score(X_test, y_home_test)
         baseline_away_r2 = reg_away.score(X_test, y_away_test)
         logging.info(
-            "Game outcome baseline final-fold metrics | train=%d | val=%d | accuracy=%.3f",
-            n_train,
-            n_val,
+            "Trained game outcome classifier (baseline), accuracy=%.3f",
             baseline_winner_acc,
         )
         logging.info(
-            "Home score baseline final-fold metrics | train=%d | val=%d | R^2=%.3f",
-            n_train,
-            n_val,
+            "Trained home score regressor (baseline), R^2=%.3f",
             baseline_home_r2,
         )
         logging.info(
-            "Away score baseline final-fold metrics | train=%d | val=%d | R^2=%.3f",
-            n_train,
-            n_val,
+            "Trained away score regressor (baseline), R^2=%.3f",
             baseline_away_r2,
         )
 
@@ -1736,50 +2029,44 @@ class ModelTrainer:
 
         winner_pred = best_clf.predict(X_test)
         winner_proba = best_clf.predict_proba(X_test)[:, 1]
-        tuned_winner_acc = accuracy_score(y_winner_test, winner_pred)
+        winner_accuracy = accuracy_score(y_winner_test, winner_pred)
         try:
-            tuned_winner_roc_auc = (
+            winner_roc_auc = (
                 roc_auc_score(y_winner_test, winner_proba)
                 if len(np.unique(y_winner_test)) > 1
                 else float("nan")
             )
         except ValueError:
-            tuned_winner_roc_auc = float("nan")
+            winner_roc_auc = float("nan")
         try:
-            tuned_winner_log_loss = log_loss(y_winner_test, winner_proba, labels=[0, 1])
+            winner_log_loss = log_loss(y_winner_test, winner_proba, labels=[0, 1])
         except ValueError:
-            tuned_winner_log_loss = float("nan")
+            winner_log_loss = float("nan")
         logging.info(
-            "Game outcome tuned final-fold metrics | train=%d | val=%d | accuracy=%.3f | ROC-AUC=%s | log-loss=%s",
-            n_train,
-            n_val,
-            tuned_winner_acc,
-            f"{tuned_winner_roc_auc:.3f}" if not np.isnan(tuned_winner_roc_auc) else "nan",
-            f"{tuned_winner_log_loss:.3f}" if not np.isnan(tuned_winner_log_loss) else "nan",
+            "Game winner holdout metrics | accuracy=%.3f | ROC-AUC=%s | log_loss=%s",
+            winner_accuracy,
+            f"{winner_roc_auc:.3f}" if not np.isnan(winner_roc_auc) else "nan",
+            f"{winner_log_loss:.3f}" if not np.isnan(winner_log_loss) else "nan",
         )
 
         home_pred = best_reg_home.predict(X_test)
-        tuned_home_r2 = best_reg_home.score(X_test, y_home_test)
+        home_r2 = best_reg_home.score(X_test, y_home_test)
         home_mae = mean_absolute_error(y_home_test, home_pred)
         home_rmse = float(np.sqrt(mean_squared_error(y_home_test, home_pred)))
         logging.info(
-            "Home score tuned final-fold metrics | train=%d | val=%d | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
-            n_train,
-            n_val,
-            tuned_home_r2,
+            "Home score holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
+            home_r2,
             home_mae,
             home_rmse,
         )
 
         away_pred = best_reg_away.predict(X_test)
-        tuned_away_r2 = best_reg_away.score(X_test, y_away_test)
+        away_r2 = best_reg_away.score(X_test, y_away_test)
         away_mae = mean_absolute_error(y_away_test, away_pred)
         away_rmse = float(np.sqrt(mean_squared_error(y_away_test, away_pred)))
         logging.info(
-            "Away score tuned final-fold metrics | train=%d | val=%d | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
-            n_train,
-            n_val,
-            tuned_away_r2,
+            "Away score holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
+            away_r2,
             away_mae,
             away_rmse,
         )
@@ -1788,6 +2075,9 @@ class ModelTrainer:
         best_clf.fit(X_full, (sorted_df["game_result"] == "home").astype(int))
         best_reg_home.fit(X_full, sorted_df["home_score"])
         best_reg_away.fit(X_full, sorted_df["away_score"])
+        setattr(best_clf, "feature_columns", feature_columns)
+        setattr(best_reg_home, "feature_columns", feature_columns)
+        setattr(best_reg_away, "feature_columns", feature_columns)
 
         return {
             "game_winner": best_clf,
@@ -1801,119 +2091,170 @@ class ModelTrainer:
 # ---------------------------------------------------------------------------
 
 
-def predict_upcoming_games(models: Dict[str, Pipeline], engine: Engine, output_path: Path) -> pd.DataFrame:
+def predict_upcoming_games(
+    models: Dict[str, Pipeline],
+    engine: Engine,
+    output_path: Optional[Path] = None,
+    save_json: bool = False,
+) -> Dict[str, pd.DataFrame]:
     games = pd.read_sql_table("nfl_games", engine)
-    upcoming = games[(games["status"].isin(["upcoming", "scheduled"])) | games["home_score"].isna()]
-    if upcoming.empty:
-        logging.warning("No upcoming games found for prediction")
-        return pd.DataFrame()
-
-    feature_builder = FeatureBuilder(engine)
-    datasets = feature_builder.build_features()
-    # Use latest features for upcoming games by merging with context features
-    games_context = datasets["game_outcome"]
-    future_games = upcoming.merge(
-        games_context,
-        on="game_id",
-        how="left",
-        suffixes=("", "_hist"),
+    games["start_time"] = pd.to_datetime(games["start_time"])
+    games["day_of_week"] = games["day_of_week"].where(
+        games["day_of_week"].notna(), games["start_time"].dt.day_name()
     )
 
-    # Predictions
-    predictions: List[Dict[str, Any]] = []
-    for _, row in future_games.iterrows():
-        prediction_id_base = f"{row['game_id']}"
-        base_feature_cols = [
-            "week",
-            "temperature_f",
-            "home_moneyline",
-            "away_moneyline",
-            "home_implied_prob",
-            "away_implied_prob",
-            "moneyline_diff",
-            "implied_prob_diff",
-            "implied_prob_sum",
-            "home_offense_pass_rating",
-            "home_offense_rush_rating",
-            "home_defense_pass_rating",
-            "home_defense_rush_rating",
-            "away_offense_pass_rating",
-            "away_offense_rush_rating",
-            "away_defense_pass_rating",
-            "away_defense_rush_rating",
-            "home_points_for_avg",
-            "home_points_against_avg",
-            "home_point_diff_avg",
-            "home_win_pct_recent",
-            "home_prev_points_for",
-            "home_prev_points_against",
-            "home_prev_point_diff",
-            "home_rest_days",
-            "away_points_for_avg",
-            "away_points_against_avg",
-            "away_point_diff_avg",
-            "away_win_pct_recent",
-            "away_prev_points_for",
-            "away_prev_points_against",
-            "away_prev_point_diff",
-            "away_rest_days",
-            "venue",
-            "day_of_week",
-            "referee",
-            "home_team",
-            "away_team",
-        ]
-        weather_feature_cols = [
-            col for col in WEATHER_CATEGORICAL_FEATURES if col in future_games.columns
-        ]
-        feature_cols = base_feature_cols + [
-            col for col in weather_feature_cols if col not in base_feature_cols
-        ]
-        features = row[feature_cols]
+    upcoming_mask = (games["status"].isin(["upcoming", "scheduled", "inprogress"])) | games["home_score"].isna()
+    upcoming = games.loc[upcoming_mask].copy()
+    if upcoming.empty:
+        logging.warning("No upcoming games found for prediction")
+        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
 
-        winner_prob = models["game_winner"].predict_proba(pd.DataFrame([features]))[0, 1]
-        home_points = models["home_points"].predict(pd.DataFrame([features]))[0]
-        away_points = models["away_points"].predict(pd.DataFrame([features]))[0]
+    upcoming = upcoming[upcoming["day_of_week"].isin(["Thursday", "Sunday", "Monday"])]
+    if upcoming.empty:
+        logging.warning("No Thursday/Sunday/Monday games available for prediction")
+        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
 
-        predictions.extend(
-            [
-                {
-                    "prediction_id": f"{prediction_id_base}_winner",
-                    "game_id": row["game_id"],
-                    "entity_type": "game",
-                    "entity_id": row["game_id"],
-                    "prediction_target": "home_win_probability",
-                    "prediction_value": float(winner_prob),
-                    "model_version": "gbm_v1",
-                    "features": features.to_dict(),
-                },
-                {
-                    "prediction_id": f"{prediction_id_base}_home_pts",
-                    "game_id": row["game_id"],
-                    "entity_type": "game",
-                    "entity_id": row["home_team"],
-                    "prediction_target": "projected_points",
-                    "prediction_value": float(home_points),
-                    "model_version": "gbm_v1",
-                    "features": features.to_dict(),
-                },
-                {
-                    "prediction_id": f"{prediction_id_base}_away_pts",
-                    "game_id": row["game_id"],
-                    "entity_type": "game",
-                    "entity_id": row["away_team"],
-                    "prediction_target": "projected_points",
-                    "prediction_value": float(away_points),
-                    "model_version": "gbm_v1",
-                    "features": features.to_dict(),
-                },
-            ]
+    feature_builder = FeatureBuilder(engine)
+    feature_builder.build_features()
+
+    def _ensure_model_features(frame: pd.DataFrame, model: Pipeline) -> pd.DataFrame:
+        columns = getattr(model, "feature_columns", None)
+        if not columns:
+            return frame
+        missing = [col for col in columns if col not in frame.columns]
+        if missing:
+            frame = frame.copy()
+            for col in missing:
+                frame[col] = np.nan
+        return frame[columns]
+
+    # Game-level predictions
+    game_models_present = all(key in models for key in ("game_winner", "home_points", "away_points"))
+    if not game_models_present:
+        logging.error("Missing trained game-level models. Cannot generate scoreboard predictions.")
+        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+
+    game_features = feature_builder.prepare_upcoming_game_features(upcoming)
+    home_features = _ensure_model_features(game_features, models["home_points"])
+    away_features = _ensure_model_features(game_features, models["away_points"])
+    winner_features = _ensure_model_features(game_features, models["game_winner"])
+
+    away_predictions = models["away_points"].predict(away_features)
+    home_predictions = models["home_points"].predict(home_features)
+    winner_probs = models["game_winner"].predict_proba(winner_features)[:, 1]
+
+    scoreboard = upcoming[["game_id", "start_time", "away_team", "home_team"]].copy()
+    scoreboard["away_score"] = away_predictions
+    scoreboard["home_score"] = home_predictions
+    scoreboard["home_win_probability"] = winner_probs
+    scoreboard["date"] = scoreboard["start_time"].dt.date.astype(str)
+    scoreboard = scoreboard[
+        ["game_id", "date", "away_team", "home_team", "away_score", "home_score", "home_win_probability"]
+    ].rename(
+        columns={
+            "away_team": "away_team_abbr",
+            "home_team": "home_team_abbr",
+        }
+    )
+
+    # Player-level predictions
+    player_features = feature_builder.prepare_upcoming_player_features(upcoming)
+    player_predictions = pd.DataFrame()
+    if not player_features.empty:
+        player_predictions = player_features[
+            ["game_id", "team", "player_id", "player_name", "position"]
+        ].copy()
+
+        for target, model in models.items():
+            if target in {"game_winner", "home_points", "away_points"}:
+                continue
+            features_for_model = _ensure_model_features(player_features, model)
+            try:
+                preds = model.predict(features_for_model)
+            except Exception:
+                logging.exception("Failed to generate predictions for %s", target)
+                continue
+            player_predictions[f"pred_{target}"] = preds
+
+        for column in [
+            "pred_rushing_yards",
+            "pred_receiving_yards",
+            "pred_receptions",
+            "pred_rushing_tds",
+            "pred_receiving_tds",
+            "pred_passing_tds",
+        ]:
+            if column not in player_predictions.columns:
+                player_predictions[column] = np.nan
+
+        value_columns = [
+            "pred_rushing_yards",
+            "pred_receiving_yards",
+            "pred_receptions",
+            "pred_rushing_tds",
+            "pred_receiving_tds",
+            "pred_passing_tds",
+        ]
+        player_predictions[value_columns] = player_predictions[value_columns].fillna(0.0)
+
+        player_predictions["pred_touchdowns"] = (
+            player_predictions["pred_rushing_tds"].fillna(0)
+            + player_predictions["pred_receiving_tds"].fillna(0)
+            + player_predictions["pred_passing_tds"].fillna(0)
         )
 
-    predictions_df = pd.DataFrame(predictions)
-    predictions_df.to_json(output_path, orient="records", indent=2)
-    logging.info("Saved %d game predictions to %s", len(predictions_df), output_path)
-    return predictions_df
+    # Reporting output
+    lines: List[str] = []
+    lines.append("date, away_team_abbr, home_team_abbr, away_score, home_score")
+    for row in scoreboard.itertuples(index=False):
+        lines.append(
+            f"{row.date}, {row.away_team_abbr}, {row.home_team_abbr}, "
+            f"{row.away_score:.6f}, {row.home_score:.6f}"
+        )
+
+    position_order = {"QB": 0, "RB": 1, "HB": 1, "FB": 1, "WR": 2, "TE": 3}
+
+    if not player_predictions.empty:
+        for game in scoreboard.itertuples(index=False):
+            lines.append("")
+            lines.append(f"{game.away_team_abbr} vs {game.home_team_abbr}")
+            lines.append("----------")
+            lines.append(
+                "Player Name, Rushing Yards, Receiving Yards, Receptions, Touchdowns, Passing Touchdowns"
+            )
+            lines.append("=" * 88)
+
+            game_players = player_predictions[player_predictions["game_id"] == game.game_id]
+            for team in [game.away_team_abbr, game.home_team_abbr]:
+                team_players = game_players[game_players["team"] == team]
+                team_players = team_players.copy()
+                team_players["_pos_order"] = team_players["position"].map(position_order).fillna(9)
+                team_players = team_players.sort_values(
+                    ["_pos_order", "pred_touchdowns", "pred_receptions"], ascending=[True, False, False]
+                )
+                for player in team_players.itertuples(index=False):
+                    name = player.player_name or "Unknown Player"
+                    lines.append(
+                        f"{name} ({team} {player.position}), "
+                        f"{player.pred_rushing_yards:.2f}, "
+                        f"{player.pred_receiving_yards:.2f}, "
+                        f"{player.pred_receptions:.2f}, "
+                        f"{player.pred_touchdowns:.2f}, "
+                        f"{player.pred_passing_tds:.2f}"
+                    )
+
+    report_text = "\n".join(lines)
+    print(report_text)
+
+    if save_json and output_path is not None:
+        output_payload = {
+            "games": scoreboard.to_dict(orient="records"),
+            "players": player_predictions.drop(columns=[col for col in player_predictions.columns if col.startswith("_")]).to_dict(orient="records"),
+        }
+        output_path.write_text(json.dumps(output_payload, indent=2))
+        logging.info("Saved prediction summary to %s", output_path)
+
+    return {"games": scoreboard, "players": player_predictions}
 
 
 # ---------------------------------------------------------------------------
@@ -1985,8 +2326,13 @@ def main() -> None:
             logging.error("Prediction generation skipped because no models were available.")
         return
 
-    if args.predict:
-        predict_upcoming_games(models, engine, args.output)
+    predict_upcoming_games(
+        models,
+        engine,
+        output_path=args.output if args.predict else None,
+        save_json=args.predict,
+    )
+
 
 
 if __name__ == "__main__":
