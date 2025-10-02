@@ -788,6 +788,7 @@ class NFLIngestor:
 
         return first_numeric(score_payload, home_candidates), first_numeric(score_payload, away_candidates)
 
+
 # ---------------------------------------------------------------------------
 # Feature engineering & modeling
 # ---------------------------------------------------------------------------
@@ -807,7 +808,6 @@ class FeatureBuilder:
         self.team_history_latest_by_season: Optional[pd.DataFrame] = None
         self.team_history_latest_overall: Optional[pd.DataFrame] = None
         self.context_feature_frame: Optional[pd.DataFrame] = None
-
 
     def load_dataframes(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         games = pd.read_sql_table("nfl_games", self.engine)
@@ -859,7 +859,6 @@ class FeatureBuilder:
             empty_history = team_game_history.iloc[0:0]
             self.team_history_latest_by_season = empty_history
             self.team_history_latest_overall = empty_history
-
 
         datasets: Dict[str, pd.DataFrame] = {}
         team_strength: pd.DataFrame
@@ -931,6 +930,7 @@ class FeatureBuilder:
             )
 
             context_features = self._compute_contextual_averages(player_stats)
+            self.context_feature_frame = context_features
             player_stats = player_stats.merge(
                 context_features,
                 on=["team", "venue", "day_of_week", "referee"],
@@ -988,6 +988,7 @@ class FeatureBuilder:
             self.player_feature_frame = pd.DataFrame(columns=player_stats.columns)
         else:
             self.player_feature_frame = player_stats
+
         home_strength = team_strength.rename(
             columns={
                 "team": "home_team",
@@ -1608,16 +1609,15 @@ class ModelTrainer:
 
         train_df = df_sorted.iloc[:split_index]
         test_df = df_sorted.iloc[split_index:]
-
         return train_df, test_df, df_sorted
 
     def _build_time_series_cv(self, n_samples: int) -> TimeSeriesSplit:
         if n_samples < 3:
             raise ValueError("At least 3 samples are required for time series CV.")
+
         n_splits = min(5, max(2, n_samples - 1))
         if n_splits >= n_samples:
             n_splits = n_samples - 1
-
         return TimeSeriesSplit(n_splits=n_splits)
 
     @staticmethod
@@ -1755,7 +1755,6 @@ class ModelTrainer:
         model.fit(X_train, y_train)
         setattr(model, "feature_columns", feature_columns)
         setattr(model, "target_name", target)
-
         baseline_pred = model.predict(X_test)
         baseline_r2 = model.score(X_test, y_test)
         baseline_mae = mean_absolute_error(y_test, baseline_pred)
@@ -1890,7 +1889,6 @@ class ModelTrainer:
         X_train = train_df[feature_columns]
         X_test = test_df[feature_columns]
 
-
         y_winner_train = (train_df["game_result"] == "home").astype(int)
         y_winner_test = (test_df["game_result"] == "home").astype(int)
 
@@ -1946,7 +1944,6 @@ class ModelTrainer:
         setattr(reg_home, "feature_columns", feature_columns)
         setattr(reg_away, "feature_columns", feature_columns)
 
-
         baseline_winner_acc = clf.score(X_test, y_winner_test)
         baseline_home_r2 = reg_home.score(X_test, y_home_test)
         baseline_away_r2 = reg_away.score(X_test, y_away_test)
@@ -1974,7 +1971,6 @@ class ModelTrainer:
                 "Skipping hyperparameter tuning for game models due to insufficient data: %s",
                 exc,
             )
-
         else:
             clf_search = RandomizedSearchCV(
                 estimator=clf,
@@ -2097,7 +2093,7 @@ def predict_upcoming_games(
     output_path: Optional[Path] = None,
     save_json: bool = False,
 ) -> Dict[str, pd.DataFrame]:
-    games = pd.read_sql_table("nfl_games", engine)
+    games = pd.read_sql_table("nfl_games", engine).rename(columns=lambda col: str(col))
     games["start_time"] = pd.to_datetime(games["start_time"])
     games["day_of_week"] = games["day_of_week"].where(
         games["day_of_week"].notna(), games["start_time"].dt.day_name()
@@ -2332,7 +2328,6 @@ def main() -> None:
         output_path=args.output if args.predict else None,
         save_json=args.predict,
     )
-
 
 
 if __name__ == "__main__":
