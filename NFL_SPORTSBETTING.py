@@ -733,8 +733,29 @@ class NFLIngestor:
         odds_rows: List[Dict[str, Any]] = []
         for event in odds_data:
             commence_time = parse_dt(event.get("commence_time"))
-            home_team = event.get("home_team")
-            away_team = next((t for t in event.get("teams", []) if t != home_team), None)
+
+            teams_list = [team for team in (event.get("teams") or []) if team]
+
+            home_team_raw = event.get("home_team") or (teams_list[0] if teams_list else None)
+            away_team_raw = event.get("away_team")
+            if not away_team_raw and teams_list:
+                away_team_raw = next(
+                    (team for team in teams_list if team != home_team_raw),
+                    teams_list[0] if teams_list else None,
+                )
+
+            home_team = normalize_team_abbr(home_team_raw)
+            away_team = normalize_team_abbr(away_team_raw)
+
+            if not home_team or not away_team:
+                logging.debug(
+                    "Skipping odds event %s due to unmapped team names (home=%s, away=%s)",
+                    event.get("id"),
+                    home_team_raw,
+                    away_team_raw,
+                )
+                continue
+
             markets = event.get("bookmakers", [])
             if not markets:
                 continue
@@ -791,13 +812,15 @@ class NFLIngestor:
             ["game_id"],
             update_columns=[
                 "start_time",
-                "home_moneyline",
-                "away_moneyline",
-                "home_implied_prob",
-                "away_implied_prob",
-                "odds_updated",
-            ],
-        )
+            "home_moneyline",
+            "away_moneyline",
+            "home_implied_prob",
+            "away_implied_prob",
+            "odds_updated",
+            "home_team",
+            "away_team",
+        ],
+    )
 
     @staticmethod
     def _safe_float(value: Any) -> Optional[float]:
