@@ -398,6 +398,7 @@ class NFLIngestor:
 
                 game_id_str = str(game_id)
                 have_player_stats = game_id_str in games_with_stats
+
                 score = game.get("score") or {}
                 home_score, away_score = self._extract_score_totals(score)
                 start_time = parse_dt(schedule.get("startTime"))
@@ -779,6 +780,8 @@ class NFLIngestor:
         )
 
         return first_numeric(score_payload, home_candidates), first_numeric(score_payload, away_candidates)
+
+      
 # ---------------------------------------------------------------------------
 # Feature engineering & modeling
 # ---------------------------------------------------------------------------
@@ -1192,7 +1195,15 @@ class FeatureBuilder:
 
             return group
 
-        team_games = team_games.groupby(["team", "season"], group_keys=False).apply(compute_group)
+        grouped_frames: List[pd.DataFrame] = []
+        for _, group in team_games.groupby(["team", "season"], sort=False):
+            grouped_frames.append(compute_group(group))
+
+        if grouped_frames:
+            team_games = pd.concat(grouped_frames, ignore_index=True)
+        else:
+            team_games = team_games.iloc[0:0]
+
 
         return team_games[
             [
