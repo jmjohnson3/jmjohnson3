@@ -125,7 +125,93 @@ TEAM_NAME_TO_ABBR = {
     "washington commanders": "WAS",
     "washington football team": "WAS",
     "washington redskins": "WAS",
+    "st. louis rams": "LAR",
+    "st louis rams": "LAR",
 }
+
+TEAM_ABBR_CANONICAL = {
+    "ARI": "arizona cardinals",
+    "ATL": "atlanta falcons",
+    "BAL": "baltimore ravens",
+    "BUF": "buffalo bills",
+    "CAR": "carolina panthers",
+    "CHI": "chicago bears",
+    "CIN": "cincinnati bengals",
+    "CLE": "cleveland browns",
+    "DAL": "dallas cowboys",
+    "DEN": "denver broncos",
+    "DET": "detroit lions",
+    "GB": "green bay packers",
+    "HOU": "houston texans",
+    "IND": "indianapolis colts",
+    "JAX": "jacksonville jaguars",
+    "KC": "kansas city chiefs",
+    "LV": "las vegas raiders",
+    "LAC": "los angeles chargers",
+    "LAR": "los angeles rams",
+    "MIA": "miami dolphins",
+    "MIN": "minnesota vikings",
+    "NE": "new england patriots",
+    "NO": "new orleans saints",
+    "NYG": "new york giants",
+    "NYJ": "new york jets",
+    "PHI": "philadelphia eagles",
+    "PIT": "pittsburgh steelers",
+    "SF": "san francisco 49ers",
+    "SEA": "seattle seahawks",
+    "TB": "tampa bay buccaneers",
+    "TEN": "tennessee titans",
+    "WAS": "washington commanders",
+}
+
+_NULL_TEAM_TOKENS = {"", "none", "null", "nan", "tbd", "tba", "n/a", "na", "--"}
+
+TEAM_MASCOT_TO_ABBR = {
+    "cardinals": "ARI",
+    "falcons": "ATL",
+    "ravens": "BAL",
+    "bills": "BUF",
+    "panthers": "CAR",
+    "bears": "CHI",
+    "bengals": "CIN",
+    "browns": "CLE",
+    "cowboys": "DAL",
+    "broncos": "DEN",
+    "lions": "DET",
+    "packers": "GB",
+    "texans": "HOU",
+    "colts": "IND",
+    "jaguars": "JAX",
+    "chiefs": "KC",
+    "raiders": "LV",
+    "chargers": "LAC",
+    "rams": "LAR",
+    "dolphins": "MIA",
+    "vikings": "MIN",
+    "patriots": "NE",
+    "saints": "NO",
+    "giants": "NYG",
+    "jets": "NYJ",
+    "eagles": "PHI",
+    "steelers": "PIT",
+    "49ers": "SF",
+    "niners": "SF",
+    "seahawks": "SEA",
+    "buccaneers": "TB",
+    "bucs": "TB",
+    "titans": "TEN",
+    "commanders": "WAS",
+    "football team": "WAS",
+}
+
+
+def _sanitize_team_key(text: str) -> str:
+    cleaned = []
+    for ch in text.lower():
+        if ch.isalnum() or ch.isspace():
+            cleaned.append(ch)
+    normalized = " ".join("".join(cleaned).split())
+    return normalized
 
 
 def normalize_team_abbr(value: Any) -> Optional[str]:
@@ -140,20 +226,50 @@ def normalize_team_abbr(value: Any) -> Optional[str]:
     if not text:
         return None
 
+    lowered = text.lower().strip()
+    if lowered in _NULL_TEAM_TOKENS:
+        return None
+
     candidate = text.upper().replace(" ", "")
     if len(candidate) <= 4 and candidate.isalpha():
-        return candidate
+        if candidate in TEAM_ABBR_CANONICAL:
+            return candidate
+        # Some feeds already provide three-letter abbreviations with spaces
+        spaced_candidate = " ".join(candidate)
+        if spaced_candidate in TEAM_NAME_TO_ABBR:
+            return TEAM_NAME_TO_ABBR[spaced_candidate]
 
-    key = text.lower().replace(".", "").strip()
-    if key in TEAM_NAME_TO_ABBR:
-        return TEAM_NAME_TO_ABBR[key]
+    sanitized = _sanitize_team_key(text)
+    if not sanitized:
+        return None
 
-    # Handle alternate spacing such as "los angeles" vs "losangeles".
-    compact_key = key.replace(" ", "")
+    if sanitized in TEAM_NAME_TO_ABBR:
+        return TEAM_NAME_TO_ABBR[sanitized]
+
+    compact_key = sanitized.replace(" ", "")
     if compact_key in TEAM_NAME_TO_ABBR:
         return TEAM_NAME_TO_ABBR[compact_key]
 
-    return text.upper()
+    for abbr, canonical in TEAM_ABBR_CANONICAL.items():
+        if sanitized == canonical:
+            return abbr
+        if canonical in sanitized:
+            return abbr
+
+    if sanitized in TEAM_MASCOT_TO_ABBR:
+        return TEAM_MASCOT_TO_ABBR[sanitized]
+
+    # As a last resort, try to map by taking the first letter of each token
+    tokens = sanitized.split()
+    if len(tokens) >= 2:
+        initials = "".join(token[0] for token in tokens)
+        if initials.upper() in TEAM_ABBR_CANONICAL:
+            return initials.upper()
+
+    if len(candidate) <= 4 and candidate.isalpha():
+        return candidate
+
+    return None
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -1305,11 +1421,14 @@ class FeatureBuilder:
             .groupby("player_id", as_index=False)
             .tail(1)
         )
+        latest_players["team"] = latest_players["team"].apply(normalize_team_abbr)
         latest_players = latest_players[latest_players["team"].notna()]
 
         games = upcoming_games.copy()
         games["start_time"] = pd.to_datetime(games["start_time"])
         games["day_of_week"] = games["start_time"].dt.day_name()
+        games["home_team"] = games["home_team"].apply(normalize_team_abbr)
+        games["away_team"] = games["away_team"].apply(normalize_team_abbr)
 
         selected_rows: List[pd.Series] = []
 
