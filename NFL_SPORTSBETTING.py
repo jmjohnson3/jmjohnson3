@@ -398,7 +398,6 @@ class NFLIngestor:
 
                 game_id_str = str(game_id)
                 have_player_stats = game_id_str in games_with_stats
-
                 score = game.get("score") or {}
                 home_score, away_score = self._extract_score_totals(score)
                 start_time = parse_dt(schedule.get("startTime"))
@@ -780,8 +779,6 @@ class NFLIngestor:
         )
 
         return first_numeric(score_payload, home_candidates), first_numeric(score_payload, away_candidates)
-
-
 # ---------------------------------------------------------------------------
 # Feature engineering & modeling
 # ---------------------------------------------------------------------------
@@ -996,6 +993,7 @@ class FeatureBuilder:
         )
         games_context["implied_prob_sum"] = (
             games_context["home_implied_prob"] + games_context["away_implied_prob"]
+
         )
 
         games_context["point_diff"] = games_context["home_score"] - games_context["away_score"]
@@ -1388,6 +1386,7 @@ class ModelTrainer:
             "away_prev_points_against",
             "away_prev_point_diff",
             "away_rest_days",
+
         ]
         categorical_features = ["venue", "day_of_week", "referee", "home_team", "away_team"]
 
