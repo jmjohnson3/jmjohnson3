@@ -31,6 +31,8 @@ from requests import HTTPError
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.impute import SimpleImputer
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score,
     log_loss,
@@ -787,8 +789,6 @@ class NFLIngestor:
         )
 
         return first_numeric(score_payload, home_candidates), first_numeric(score_payload, away_candidates)
-
-      
 # ---------------------------------------------------------------------------
 # Feature engineering & modeling
 # ---------------------------------------------------------------------------
@@ -1003,7 +1003,6 @@ class FeatureBuilder:
         )
         games_context["implied_prob_sum"] = (
             games_context["home_implied_prob"] + games_context["away_implied_prob"]
-
         )
 
         games_context["point_diff"] = games_context["home_score"] - games_context["away_score"]
@@ -1032,6 +1031,39 @@ class FeatureBuilder:
                 ]
             )
 
+        grouped = (
+            player_stats.groupby(["season", "week", "team"])
+            .agg(
+                rush_yards=pd.NamedAgg(column="rushing_yards", aggfunc="sum"),
+                rush_tds=pd.NamedAgg(column="rushing_tds", aggfunc="sum"),
+                rec_yards=pd.NamedAgg(column="receiving_yards", aggfunc="sum"),
+                rec_tds=pd.NamedAgg(column="receiving_tds", aggfunc="sum"),
+                pass_yards=pd.NamedAgg(column="passing_yards", aggfunc="sum"),
+                pass_tds=pd.NamedAgg(column="passing_tds", aggfunc="sum"),
+            )
+            .reset_index()
+        )
+
+        grouped = grouped.sort_values(["team", "season", "week"]).reset_index(drop=True)
+        for col in ["rush_yards", "rush_tds", "rec_yards", "rec_tds", "pass_yards", "pass_tds"]:
+            grouped[f"rolling_{col}"] = (
+                grouped.groupby(["team", "season"])[col]
+                .rolling(window=4, min_periods=1)
+                .mean()
+                .reset_index(level=[0, 1], drop=True)
+            )
+
+        # Offense: use rushing and passing production. Defense approximated by opponent restriction.
+        grouped["offense_rush_rating"] = grouped[["rolling_rush_yards", "rolling_rush_tds"]].mean(axis=1)
+        grouped["offense_pass_rating"] = grouped[["rolling_pass_yards", "rolling_pass_tds", "rolling_rec_yards", "rolling_rec_tds"]].mean(axis=1)
+
+        # Defense derived by comparing to league averages (placeholder). In practice, integrate opponent stats.
+        grouped["defense_rush_rating"] = grouped.groupby(["season", "week"])["offense_rush_rating"].transform("mean") - grouped["offense_rush_rating"]
+        grouped["defense_pass_rating"] = grouped.groupby(["season", "week"])["offense_pass_rating"].transform("mean") - grouped["offense_pass_rating"]
+
+        cols = ["season", "week", "team", "offense_pass_rating", "offense_rush_rating", "defense_pass_rating", "defense_rush_rating"]
+
+        return grouped[cols]
         stats = player_stats.copy()
 
         numeric_cols = [
@@ -1330,8 +1362,6 @@ class FeatureBuilder:
             team_games = pd.concat(grouped_frames, ignore_index=True)
         else:
             team_games = team_games.iloc[0:0]
-
-
         return team_games[
             [
                 "game_id",
@@ -1358,6 +1388,7 @@ class ModelTrainer:
     def __init__(self, engine: Engine):
         self.engine = engine
         self.feature_builder = FeatureBuilder(engine)
+
 
     def _sort_by_time(self, df: pd.DataFrame) -> pd.DataFrame:
         if "start_time" in df.columns:
@@ -1485,12 +1516,16 @@ class ModelTrainer:
             return None
 
         feature_columns = available_numeric + available_categorical
+        X = df[feature_columns]
+        y = df[target]
+
 
         train_df, test_df, sorted_df = self._chronological_split(df)
         X_train = train_df[feature_columns]
         y_train = train_df[target]
         X_test = test_df[feature_columns]
         y_test = test_df[target]
+
 
         transformers = []
         if available_numeric:
@@ -1523,6 +1558,20 @@ class ModelTrainer:
             ("regressor", GradientBoostingRegressor(random_state=42)),
         ])
 
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        model.fit(X_train, y_train)
+        score = model.score(X_test, y_test)
+        y_pred = model.predict(X_test)
+        mae = mean_absolute_error(y_test, y_pred)
+        rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+        logging.info(
+            "Trained %s model, R^2=%.3f on holdout (MAE=%.3f, RMSE=%.3f)",
+            target,
+            score,
+            mae,
+            rmse,
+        )
+        return model
         try:
             cv = self._build_time_series_cv(len(X_train))
         except ValueError as exc:
@@ -1643,6 +1692,11 @@ class ModelTrainer:
 
         feature_columns = available_numeric + available_categorical
 
+        X = df[feature_columns]
+        y_winner = (df["game_result"] == "home").astype(int)
+        y_home_score = df["home_score"]
+        y_away_score = df["away_score"]
+
         train_df, test_df, sorted_df = self._chronological_split(df)
         X_train = train_df[feature_columns]
         X_test = test_df[feature_columns]
@@ -1694,6 +1748,20 @@ class ModelTrainer:
             ("preprocessor", preprocessor),
             ("regressor", GradientBoostingRegressor(random_state=42)),
         ])
+
+        X_train, X_test, y_train, y_test = train_test_split(X, y_winner, test_size=0.2, random_state=42)
+        clf.fit(X_train, y_train)
+        clf_score = clf.score(X_test, y_test)
+        logging.info("Trained game outcome classifier, accuracy=%.3f", clf_score)
+
+        X_train, X_test, y_train, y_test = train_test_split(X, y_home_score, test_size=0.2, random_state=42)
+        reg_home.fit(X_train, y_train)
+        logging.info("Trained home score regressor, R^2=%.3f", reg_home.score(X_test, y_test))
+
+        X_train, X_test, y_train, y_test = train_test_split(X, y_away_score, test_size=0.2, random_state=42)
+        reg_away.fit(X_train, y_train)
+        logging.info("Trained away score regressor, R^2=%.3f", reg_away.score(X_test, y_test))
+
         try:
             cv = self._build_time_series_cv(len(X_train))
         except ValueError as exc:
