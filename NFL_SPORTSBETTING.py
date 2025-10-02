@@ -2350,7 +2350,49 @@ def predict_upcoming_games(
         logging.warning("Upcoming games are missing team assignments after normalization")
         return {"games": pd.DataFrame(), "players": pd.DataFrame()}
 
-    upcoming = upcoming[upcoming["day_of_week"].isin(["Thursday", "Sunday", "Monday"])]
+    upcoming["start_time"] = pd.to_datetime(upcoming["start_time"], utc=True, errors="coerce")
+    upcoming = upcoming[upcoming["start_time"].notna()]
+    if upcoming.empty:
+        logging.warning("Upcoming games are missing valid start times after normalization")
+        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+
+    upcoming["day_of_week"] = upcoming["day_of_week"].where(
+        upcoming["day_of_week"].notna(), upcoming["start_time"].dt.day_name()
+    )
+
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    lookback = now_utc - pd.Timedelta(hours=12)
+    lookahead = now_utc + pd.Timedelta(days=7, hours=12)
+    in_window_mask = (upcoming["start_time"] >= lookback) & (
+        upcoming["start_time"] <= lookahead
+    )
+    window_games = upcoming.loc[in_window_mask].copy()
+
+    if window_games.empty:
+        earliest_start = upcoming["start_time"].min()
+        if pd.isna(earliest_start):
+            logging.warning("No upcoming games have a valid kickoff time available")
+            return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+        week_start = earliest_start.normalize() - pd.to_timedelta(earliest_start.weekday(), unit="D")
+        week_end = week_start + pd.Timedelta(days=7)
+        week_mask = (upcoming["start_time"] >= week_start) & (
+            upcoming["start_time"] <= week_end
+        )
+        window_games = upcoming.loc[week_mask].copy()
+        if window_games.empty:
+            logging.warning("No upcoming games within the current week window")
+            return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+        logging.info(
+            "Falling back to earliest scheduled week %s-%s with %d games",
+            week_start.date(),
+            week_end.date(),
+            len(window_games),
+        )
+
+    upcoming = window_games
+
+    desired_days = {"Thursday", "Sunday", "Monday"}
+    upcoming = upcoming[upcoming["day_of_week"].isin(desired_days)]
     if upcoming.empty:
         logging.warning("No Thursday/Sunday/Monday games available for prediction")
         return {"games": pd.DataFrame(), "players": pd.DataFrame()}
@@ -2365,17 +2407,6 @@ def predict_upcoming_games(
         subset=["home_team", "away_team", "start_time"], keep="first"
     )
     upcoming = upcoming.drop(columns="_priority", errors="ignore")
-
-    earliest_start = upcoming["start_time"].min()
-    if pd.notna(earliest_start):
-        week_start = earliest_start.normalize() - pd.to_timedelta(earliest_start.weekday(), unit="D")
-        week_end = week_start + pd.Timedelta(days=6)
-        week_window_mask = (upcoming["start_time"] >= week_start) & (upcoming["start_time"] <= week_end)
-        upcoming = upcoming.loc[week_window_mask]
-
-    if upcoming.empty:
-        logging.warning("No upcoming games within the current week window")
-        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
 
     upcoming = upcoming.sort_values("start_time").reset_index(drop=True)
 
