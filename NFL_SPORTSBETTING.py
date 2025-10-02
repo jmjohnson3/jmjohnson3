@@ -31,6 +31,7 @@ from requests import HTTPError
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.impute import SimpleImputer
+
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
@@ -1066,161 +1067,6 @@ class FeatureBuilder:
 
         return grouped[cols]
 
-        stats = player_stats.copy()
-
-        numeric_cols = [
-            "rushing_yards",
-            "rushing_attempts",
-            "passing_yards",
-            "passing_attempts",
-        ]
-        for col in numeric_cols:
-            if col not in stats.columns:
-                stats[col] = 0.0
-            stats[col] = stats[col].fillna(0)
-
-        team_offense = (
-            stats.dropna(subset=["team", "season", "week"])
-            .groupby(["season", "week", "team"], as_index=False)
-            .agg(
-                rush_yards=pd.NamedAgg(column="rushing_yards", aggfunc="sum"),
-                rush_att=pd.NamedAgg(column="rushing_attempts", aggfunc="sum"),
-                pass_yards=pd.NamedAgg(column="passing_yards", aggfunc="sum"),
-                pass_att=pd.NamedAgg(column="passing_attempts", aggfunc="sum"),
-            )
-        )
-
-        # Map each team to its opponent for the given week so we can measure yards allowed.
-        opponent_map = (
-            stats[
-                [
-                    "season",
-                    "week",
-                    "team",
-                    "home_team",
-                    "away_team",
-                ]
-            ]
-            .dropna(subset=["team", "home_team", "away_team", "season", "week"])
-            .drop_duplicates()
-        )
-        opponent_map["opponent"] = np.where(
-            opponent_map["team"] == opponent_map["home_team"],
-            opponent_map["away_team"],
-            np.where(
-                opponent_map["team"] == opponent_map["away_team"],
-                opponent_map["home_team"],
-                np.nan,
-            ),
-        )
-        opponent_map = opponent_map.dropna(subset=["opponent"]).drop_duplicates(
-            subset=["season", "week", "team"]
-        )
-
-        opponent_totals = team_offense.rename(
-            columns={
-                "team": "opponent",
-                "rush_yards": "opp_rush_yards",
-                "rush_att": "opp_rush_att",
-                "pass_yards": "opp_pass_yards",
-                "pass_att": "opp_pass_att",
-            }
-        )
-
-        defense_allowed = opponent_map.merge(
-            opponent_totals,
-            on=["season", "week", "opponent"],
-            how="left",
-        )
-
-        combined = team_offense.merge(
-            defense_allowed[
-                [
-                    "season",
-                    "week",
-                    "team",
-                    "opp_rush_yards",
-                    "opp_rush_att",
-                    "opp_pass_yards",
-                    "opp_pass_att",
-                ]
-            ],
-            on=["season", "week", "team"],
-            how="left",
-        )
-
-        # Compute per-attempt efficiency for offense and defense.
-        combined["rush_per_att"] = np.where(
-            combined["rush_att"] > 0,
-            combined["rush_yards"] / combined["rush_att"],
-            np.nan,
-        )
-        combined["pass_per_att"] = np.where(
-            combined["pass_att"] > 0,
-            combined["pass_yards"] / combined["pass_att"],
-            np.nan,
-        )
-        combined["allowed_rush_per_att"] = np.where(
-            combined["opp_rush_att"] > 0,
-            combined["opp_rush_yards"] / combined["opp_rush_att"],
-            np.nan,
-        )
-        combined["allowed_pass_per_att"] = np.where(
-            combined["opp_pass_att"] > 0,
-            combined["opp_pass_yards"] / combined["opp_pass_att"],
-            np.nan,
-        )
-
-        league_baselines = (
-            combined.groupby(["season", "week"], as_index=False)
-            .agg(
-                league_rush_per_att=pd.NamedAgg(column="rush_per_att", aggfunc="mean"),
-                league_pass_per_att=pd.NamedAgg(column="pass_per_att", aggfunc="mean"),
-            )
-        )
-
-        combined = combined.merge(
-            league_baselines,
-            on=["season", "week"],
-            how="left",
-        )
-
-        combined["offense_rush_rating"] = (
-            combined["rush_per_att"] - combined["league_rush_per_att"]
-        )
-        combined["offense_pass_rating"] = (
-            combined["pass_per_att"] - combined["league_pass_per_att"]
-        )
-        combined["defense_rush_rating"] = (
-            combined["league_rush_per_att"] - combined["allowed_rush_per_att"]
-        )
-        combined["defense_pass_rating"] = (
-            combined["league_pass_per_att"] - combined["allowed_pass_per_att"]
-        )
-
-        ratings = combined[
-            [
-                "season",
-                "week",
-                "team",
-                "offense_pass_rating",
-                "offense_rush_rating",
-                "defense_pass_rating",
-                "defense_rush_rating",
-            ]
-        ].sort_values(["team", "season", "week"]).reset_index(drop=True)
-
-        rating_cols = [
-            "offense_pass_rating",
-            "offense_rush_rating",
-            "defense_pass_rating",
-            "defense_rush_rating",
-        ]
-        ratings[rating_cols] = ratings[rating_cols].fillna(0)
-
-        return ratings
-
-
     def _compute_contextual_averages(self, player_stats: pd.DataFrame) -> pd.DataFrame:
         if player_stats.empty:
             return pd.DataFrame(
@@ -1365,6 +1211,7 @@ class FeatureBuilder:
             team_games = pd.concat(grouped_frames, ignore_index=True)
         else:
             team_games = team_games.iloc[0:0]
+
         return team_games[
             [
                 "game_id",
@@ -1391,49 +1238,6 @@ class ModelTrainer:
     def __init__(self, engine: Engine):
         self.engine = engine
         self.feature_builder = FeatureBuilder(engine)
-
-    def _sort_by_time(self, df: pd.DataFrame) -> pd.DataFrame:
-        if "start_time" in df.columns:
-            return df.sort_values("start_time")
-        if {"season", "week"}.issubset(df.columns):
-            return df.sort_values(["season", "week"])
-        if "week" in df.columns:
-            return df.sort_values("week")
-        return df.sort_index()
-
-    def _chronological_split(
-        self, df: pd.DataFrame, holdout_fraction: float = 0.2
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        df_sorted = self._sort_by_time(df).reset_index(drop=True)
-        if len(df_sorted) < 5:
-            split_index = max(1, len(df_sorted) - 1)
-        else:
-            holdout_size = max(1, int(len(df_sorted) * holdout_fraction))
-            if holdout_size >= len(df_sorted):
-                holdout_size = max(1, len(df_sorted) - 1)
-            split_index = len(df_sorted) - holdout_size
-        if split_index <= 0 or split_index >= len(df_sorted):
-            split_index = max(1, len(df_sorted) - 1)
-        train_df = df_sorted.iloc[:split_index]
-        test_df = df_sorted.iloc[split_index:]
-        return train_df, test_df, df_sorted
-
-    def _build_time_series_cv(self, n_samples: int) -> TimeSeriesSplit:
-        if n_samples < 3:
-            raise ValueError("At least 3 samples are required for time series CV.")
-        n_splits = min(5, max(2, n_samples - 1))
-        if n_splits >= n_samples:
-            n_splits = n_samples - 1
-        return TimeSeriesSplit(n_splits=n_splits)
-
-    @staticmethod
-    def _gb_param_grid(prefix: str) -> Dict[str, List[Any]]:
-        return {
-            f"{prefix}learning_rate": [0.01, 0.05, 0.1, 0.2],
-            f"{prefix}n_estimators": [100, 200, 300, 400],
-            f"{prefix}max_depth": [2, 3, 4],
-            f"{prefix}subsample": [0.6, 0.8, 1.0],
-        }
 
     def train(self) -> Dict[str, Pipeline]:
         datasets = self.feature_builder.build_features()
@@ -1519,9 +1323,6 @@ class ModelTrainer:
 
         feature_columns = available_numeric + available_categorical
 
-        X = df[feature_columns]
-        y = df[target]
-
         train_df, test_df, sorted_df = self._chronological_split(df)
         X_train = train_df[feature_columns]
         y_train = train_df[target]
@@ -1559,21 +1360,19 @@ class ModelTrainer:
             ("regressor", GradientBoostingRegressor(random_state=42)),
         ])
 
-
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
         model.fit(X_train, y_train)
-        score = model.score(X_test, y_test)
-        y_pred = model.predict(X_test)
-        mae = mean_absolute_error(y_test, y_pred)
-        rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+        baseline_pred = model.predict(X_test)
+        baseline_r2 = model.score(X_test, y_test)
+        baseline_mae = mean_absolute_error(y_test, baseline_pred)
+        baseline_rmse = float(np.sqrt(mean_squared_error(y_test, baseline_pred)))
         logging.info(
-            "Trained %s model, R^2=%.3f on holdout (MAE=%.3f, RMSE=%.3f)",
+            "Trained %s model (baseline GBM), R^2=%.3f on holdout (MAE=%.3f, RMSE=%.3f)",
             target,
-            score,
-            mae,
-            rmse,
+            baseline_r2,
+            baseline_mae,
+            baseline_rmse,
         )
-        return model
+
         try:
             cv = self._build_time_series_cv(len(X_train))
         except ValueError as exc:
@@ -1582,7 +1381,6 @@ class ModelTrainer:
                 target,
                 exc,
             )
-            model.fit(X_train, y_train)
             best_model = model
         else:
             search = RandomizedSearchCV(
@@ -1602,7 +1400,6 @@ class ModelTrainer:
                 search.best_params_,
                 -search.best_score_,
             )
-
 
         y_pred = best_model.predict(X_test)
         r2 = best_model.score(X_test, y_test)
@@ -1694,10 +1491,6 @@ class ModelTrainer:
 
         feature_columns = available_numeric + available_categorical
 
-        X = df[feature_columns]
-        y_winner = (df["game_result"] == "home").astype(int)
-        y_home_score = df["home_score"]
-        y_away_score = df["away_score"]
 
         train_df, test_df, sorted_df = self._chronological_split(df)
         X_train = train_df[feature_columns]
@@ -1751,19 +1544,30 @@ class ModelTrainer:
             ("regressor", GradientBoostingRegressor(random_state=42)),
         ])
 
+        clf.fit(X_train, y_winner_train)
+        reg_home.fit(X_train, y_home_train)
+        reg_away.fit(X_train, y_away_train)
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y_winner, test_size=0.2, random_state=42)
-        clf.fit(X_train, y_train)
-        clf_score = clf.score(X_test, y_test)
-        logging.info("Trained game outcome classifier, accuracy=%.3f", clf_score)
+        baseline_winner_acc = clf.score(X_test, y_winner_test)
+        baseline_home_r2 = reg_home.score(X_test, y_home_test)
+        baseline_away_r2 = reg_away.score(X_test, y_away_test)
+        logging.info(
+            "Trained game outcome classifier (baseline), accuracy=%.3f",
+            baseline_winner_acc,
+        )
+        logging.info(
+            "Trained home score regressor (baseline), R^2=%.3f",
+            baseline_home_r2,
+        )
+        logging.info(
+            "Trained away score regressor (baseline), R^2=%.3f",
+            baseline_away_r2,
+        )
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y_home_score, test_size=0.2, random_state=42)
-        reg_home.fit(X_train, y_train)
-        logging.info("Trained home score regressor, R^2=%.3f", reg_home.score(X_test, y_test))
+        best_clf = clf
+        best_reg_home = reg_home
+        best_reg_away = reg_away
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y_away_score, test_size=0.2, random_state=42)
-        reg_away.fit(X_train, y_train)
-        logging.info("Trained away score regressor, R^2=%.3f", reg_away.score(X_test, y_test))
 
         try:
             cv = self._build_time_series_cv(len(X_train))
@@ -1772,12 +1576,6 @@ class ModelTrainer:
                 "Skipping hyperparameter tuning for game models due to insufficient data: %s",
                 exc,
             )
-            clf.fit(X_train, y_winner_train)
-            reg_home.fit(X_train, y_home_train)
-            reg_away.fit(X_train, y_away_train)
-            best_clf = clf
-            best_reg_home = reg_home
-            best_reg_away = reg_away
 
         else:
             clf_search = RandomizedSearchCV(
@@ -1791,9 +1589,6 @@ class ModelTrainer:
             )
             clf_search.fit(X_train, y_winner_train)
             best_clf: Pipeline = clf_search.best_estimator_
-
-            clf = clf_search.best_estimator_
-
             logging.info(
                 "Best parameters for game winner model: %s (CV ROC-AUC=%.3f)",
                 clf_search.best_params_,
@@ -1812,8 +1607,6 @@ class ModelTrainer:
             reg_home_search.fit(X_train, y_home_train)
             best_reg_home: Pipeline = reg_home_search.best_estimator_
 
-            reg_home = reg_home_search.best_estimator_
-
             logging.info(
                 "Best parameters for home score model: %s (CV MAE=%.3f)",
                 reg_home_search.best_params_,
@@ -1831,7 +1624,6 @@ class ModelTrainer:
             )
             reg_away_search.fit(X_train, y_away_train)
             best_reg_away: Pipeline = reg_away_search.best_estimator_
-
             logging.info(
                 "Best parameters for away score model: %s (CV MAE=%.3f)",
                 reg_away_search.best_params_,
@@ -1864,7 +1656,6 @@ class ModelTrainer:
         home_r2 = best_reg_home.score(X_test, y_home_test)
         home_mae = mean_absolute_error(y_home_test, home_pred)
         home_rmse = float(np.sqrt(mean_squared_error(y_home_test, home_pred)))
-
         logging.info(
             "Home score holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
             home_r2,
@@ -1876,7 +1667,6 @@ class ModelTrainer:
         away_r2 = best_reg_away.score(X_test, y_away_test)
         away_mae = mean_absolute_error(y_away_test, away_pred)
         away_rmse = float(np.sqrt(mean_squared_error(y_away_test, away_pred)))
-
         logging.info(
             "Away score holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
             away_r2,
@@ -1893,7 +1683,6 @@ class ModelTrainer:
             "game_winner": best_clf,
             "home_points": best_reg_home,
             "away_points": best_reg_away,
-
         }
 
 
