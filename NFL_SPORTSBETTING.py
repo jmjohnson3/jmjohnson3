@@ -788,7 +788,6 @@ class NFLIngestor:
 
         return first_numeric(score_payload, home_candidates), first_numeric(score_payload, away_candidates)
 
-
 # ---------------------------------------------------------------------------
 # Feature engineering & modeling
 # ---------------------------------------------------------------------------
@@ -1540,7 +1539,6 @@ class ModelTrainer:
             return {}
 
         feature_columns = available_numeric + available_categorical
-
         train_df, test_df, sorted_df = self._chronological_split(df)
         X_train = train_df[feature_columns]
         X_test = test_df[feature_columns]
@@ -1624,6 +1622,7 @@ class ModelTrainer:
                 "Skipping hyperparameter tuning for game models due to insufficient data: %s",
                 exc,
             )
+
         else:
             clf_search = RandomizedSearchCV(
                 estimator=clf,
