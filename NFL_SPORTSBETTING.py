@@ -31,9 +31,6 @@ from requests import HTTPError
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.impute import SimpleImputer
-
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score,
     log_loss,
@@ -1239,6 +1236,49 @@ class ModelTrainer:
         self.engine = engine
         self.feature_builder = FeatureBuilder(engine)
 
+    # ------------------------------------------------------------------
+    # Chronological splitting utilities
+    # ------------------------------------------------------------------
+
+    def _sort_by_time(self, df: pd.DataFrame) -> pd.DataFrame:
+        if "start_time" in df.columns:
+            return df.sort_values("start_time")
+        if {"season", "week"}.issubset(df.columns):
+            return df.sort_values(["season", "week"])
+        if "week" in df.columns:
+            return df.sort_values("week")
+        return df.sort_index()
+
+    def _chronological_split(
+        self,
+        df: pd.DataFrame,
+        holdout_fraction: float = 0.2,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        df_sorted = self._sort_by_time(df).reset_index(drop=True)
+        if len(df_sorted) < 5:
+            split_index = max(1, len(df_sorted) - 1)
+        else:
+            holdout_size = max(1, int(len(df_sorted) * holdout_fraction))
+            if holdout_size >= len(df_sorted):
+                holdout_size = max(1, len(df_sorted) - 1)
+            split_index = len(df_sorted) - holdout_size
+
+        if split_index <= 0 or split_index >= len(df_sorted):
+            split_index = max(1, len(df_sorted) - 1)
+
+        train_df = df_sorted.iloc[:split_index]
+        test_df = df_sorted.iloc[split_index:]
+        return train_df, test_df, df_sorted
+
+    def _build_time_series_cv(self, n_samples: int) -> TimeSeriesSplit:
+        if n_samples < 3:
+            raise ValueError("At least 3 samples are required for time series CV.")
+
+        n_splits = min(5, max(2, n_samples - 1))
+        if n_splits >= n_samples:
+            n_splits = n_samples - 1
+        return TimeSeriesSplit(n_splits=n_splits)
+
     def train(self) -> Dict[str, Pipeline]:
         datasets = self.feature_builder.build_features()
         models: Dict[str, Pipeline] = {}
@@ -1405,7 +1445,6 @@ class ModelTrainer:
         r2 = best_model.score(X_test, y_test)
         mae = mean_absolute_error(y_test, y_pred)
         rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
-
         logging.info(
             "%s holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
             target,
@@ -1459,7 +1498,6 @@ class ModelTrainer:
             "away_prev_points_against",
             "away_prev_point_diff",
             "away_rest_days",
-
         ]
         categorical_features = ["venue", "day_of_week", "referee", "home_team", "away_team"]
 
@@ -1490,8 +1528,6 @@ class ModelTrainer:
             return {}
 
         feature_columns = available_numeric + available_categorical
-
-
         train_df, test_df, sorted_df = self._chronological_split(df)
         X_train = train_df[feature_columns]
         X_test = test_df[feature_columns]
@@ -1567,8 +1603,6 @@ class ModelTrainer:
         best_clf = clf
         best_reg_home = reg_home
         best_reg_away = reg_away
-
-
         try:
             cv = self._build_time_series_cv(len(X_train))
         except ValueError as exc:
@@ -1606,7 +1640,6 @@ class ModelTrainer:
             )
             reg_home_search.fit(X_train, y_home_train)
             best_reg_home: Pipeline = reg_home_search.best_estimator_
-
             logging.info(
                 "Best parameters for home score model: %s (CV MAE=%.3f)",
                 reg_home_search.best_params_,
