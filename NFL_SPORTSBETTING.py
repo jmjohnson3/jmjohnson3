@@ -1449,7 +1449,17 @@ class FeatureBuilder:
 
         games = upcoming_games.copy()
         games["start_time"] = pd.to_datetime(games["start_time"])
-        games["day_of_week"] = games["start_time"].dt.day_name()
+        if "day_of_week" in games.columns:
+            games["day_of_week"] = games["day_of_week"].where(
+                games["day_of_week"].notna(), games["start_time"].dt.day_name()
+            )
+        else:
+            games["day_of_week"] = games["start_time"].dt.day_name()
+        early_mask = games["start_time"].dt.hour < 6
+        if early_mask.any():
+            games.loc[early_mask, "day_of_week"] = (
+                games.loc[early_mask, "start_time"] - pd.Timedelta(days=1)
+            ).dt.day_name()
         games["home_team"] = games["home_team"].apply(normalize_team_abbr)
         games["away_team"] = games["away_team"].apply(normalize_team_abbr)
 
@@ -2360,6 +2370,13 @@ def predict_upcoming_games(
         upcoming["day_of_week"].notna(), upcoming["start_time"].dt.day_name()
     )
 
+    early_kick_mask = upcoming["start_time"].dt.hour < 6
+    if early_kick_mask.any():
+        adjusted_days = (
+            upcoming.loc[early_kick_mask, "start_time"] - pd.Timedelta(days=1)
+        ).dt.day_name()
+        upcoming.loc[early_kick_mask, "day_of_week"] = adjusted_days
+
     now_utc = dt.datetime.now(dt.timezone.utc)
     lookback = now_utc - pd.Timedelta(hours=12)
     lookahead = now_utc + pd.Timedelta(days=7, hours=12)
@@ -2397,7 +2414,7 @@ def predict_upcoming_games(
         logging.warning("No Thursday/Sunday/Monday games available for prediction")
         return {"games": pd.DataFrame(), "players": pd.DataFrame()}
 
-    upcoming["_priority"] = upcoming["game_id"].apply(
+    upcoming.loc[:, "_priority"] = upcoming["game_id"].apply(
         lambda value: 0 if isinstance(value, str) and value.isdigit() else 1
     )
     upcoming = upcoming.sort_values(
