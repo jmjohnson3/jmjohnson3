@@ -70,6 +70,8 @@ from sqlalchemy import (
     create_engine,
     func,
     select,
+    text,
+    inspect,
 )
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
@@ -548,6 +550,31 @@ class NFLDatabase:
         self.meta = MetaData()
         self._define_tables()
         self.meta.create_all(self.engine)
+        self._apply_schema_upgrades()
+
+    def _apply_schema_upgrades(self) -> None:
+        """Ensure newly introduced columns exist on already-initialized tables."""
+
+        inspector = inspect(self.engine)
+        try:
+            game_columns = {col["name"] for col in inspector.get_columns("nfl_games")}
+        except Exception:  # pragma: no cover - defensive fallback if table missing
+            game_columns = set()
+
+        alterations: List[str] = []
+        if "wind_mph" not in game_columns:
+            alterations.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS wind_mph DOUBLE PRECISION")
+        if "humidity" not in game_columns:
+            alterations.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS humidity DOUBLE PRECISION")
+        if "injury_summary" not in game_columns:
+            alterations.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS injury_summary TEXT")
+
+        if not alterations:
+            return
+
+        with self.engine.begin() as conn:
+            for statement in alterations:
+                conn.execute(text(statement))
 
     def _define_tables(self) -> None:
         self.games = Table(
@@ -3922,8 +3949,9 @@ def main() -> None:
 
     msf_client = MySportsFeedsClient(NFL_API_USER, NFL_API_PASS)
     odds_client = OddsApiClient(ODDS_API_KEY)
+    supplemental_loader = SupplementalDataLoader(config)
 
-    ingestor = NFLIngestor(db, msf_client, odds_client)
+    ingestor = NFLIngestor(db, msf_client, odds_client, supplemental_loader)
     ingestor.ingest(config.seasons)
 
     trainer = ModelTrainer(engine, db)
