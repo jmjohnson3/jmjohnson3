@@ -2536,6 +2536,9 @@ class FeatureBuilder:
         merged["rest_penalty"] = np.nan
         merged["weather_adjustment"] = np.nan
 
+        if "timezone_diff_hours" not in merged.columns:
+            merged["timezone_diff_hours"] = np.nan
+
         result = merged[[
             "season",
             "week",
