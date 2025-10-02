@@ -919,6 +919,13 @@ class FeatureBuilder:
                         "Skipping %s dataset because no rows remained after filtering", target
                     )
                     return
+                sort_columns = [
+                    col
+                    for col in ["season", "week", "start_time"]
+                    if col in subset.columns
+                ]
+                if sort_columns:
+                    subset = subset.sort_values(sort_columns).reset_index(drop=True)
                 datasets[target] = subset
 
             add_dataset("rushing_yards", ["RB", "HB", "FB", "QB"])
@@ -1011,6 +1018,13 @@ class FeatureBuilder:
                 "No completed games with scores available. Game outcome model will be skipped."
             )
         else:
+            sort_columns = [
+                col
+                for col in ["season", "week", "start_time"]
+                if col in games_labeled.columns
+            ]
+            if sort_columns:
+                games_labeled = games_labeled.sort_values(sort_columns).reset_index(drop=True)
             datasets["game_outcome"] = games_labeled
 
         return datasets
@@ -1249,34 +1263,43 @@ class ModelTrainer:
             return df.sort_values("week")
         return df.sort_index()
 
-    def _chronological_split(
+    def _time_series_holdout_split(
         self,
         df: pd.DataFrame,
-        holdout_fraction: float = 0.2,
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         df_sorted = self._sort_by_time(df).reset_index(drop=True)
-        if len(df_sorted) < 5:
-            split_index = max(1, len(df_sorted) - 1)
-        else:
-            holdout_size = max(1, int(len(df_sorted) * holdout_fraction))
-            if holdout_size >= len(df_sorted):
-                holdout_size = max(1, len(df_sorted) - 1)
-            split_index = len(df_sorted) - holdout_size
+        n_samples = len(df_sorted)
 
-        if split_index <= 0 or split_index >= len(df_sorted):
-            split_index = max(1, len(df_sorted) - 1)
+        if n_samples <= 2:
+            split_index = max(1, n_samples - 1)
+            train_df = df_sorted.iloc[:split_index]
+            test_df = df_sorted.iloc[split_index:]
+            return train_df, test_df, df_sorted
 
-        train_df = df_sorted.iloc[:split_index]
-        test_df = df_sorted.iloc[split_index:]
+        n_splits = min(5, n_samples - 1)
+        tscv = TimeSeriesSplit(n_splits=n_splits)
+
+        final_train_idx: Optional[np.ndarray] = None
+        final_val_idx: Optional[np.ndarray] = None
+        for train_idx, val_idx in tscv.split(df_sorted):
+            final_train_idx, final_val_idx = train_idx, val_idx
+
+        if final_train_idx is None or final_val_idx is None:
+            split_index = max(1, n_samples - 1)
+            train_df = df_sorted.iloc[:split_index]
+            test_df = df_sorted.iloc[split_index:]
+            return train_df, test_df, df_sorted
+
+        train_df = df_sorted.iloc[final_train_idx]
+        test_df = df_sorted.iloc[final_val_idx]
         return train_df, test_df, df_sorted
 
     def _build_time_series_cv(self, n_samples: int) -> TimeSeriesSplit:
         if n_samples < 3:
             raise ValueError("At least 3 samples are required for time series CV.")
-
-        n_splits = min(5, max(2, n_samples - 1))
-        if n_splits >= n_samples:
-            n_splits = n_samples - 1
+        n_splits = min(5, n_samples - 1)
+        if n_splits < 2:
+            raise ValueError("Unable to build CV folds with fewer than 3 samples.")
         return TimeSeriesSplit(n_splits=n_splits)
 
     @staticmethod
@@ -1374,11 +1397,12 @@ class ModelTrainer:
 
         feature_columns = available_numeric + available_categorical
 
-        train_df, test_df, sorted_df = self._chronological_split(df)
+        train_df, test_df, sorted_df = self._time_series_holdout_split(df)
         X_train = train_df[feature_columns]
         y_train = train_df[target]
         X_test = test_df[feature_columns]
         y_test = test_df[target]
+        n_train, n_val = len(train_df), len(test_df)
 
         transformers = []
         if available_numeric:
@@ -1417,8 +1441,10 @@ class ModelTrainer:
         baseline_mae = mean_absolute_error(y_test, baseline_pred)
         baseline_rmse = float(np.sqrt(mean_squared_error(y_test, baseline_pred)))
         logging.info(
-            "Trained %s model (baseline GBM), R^2=%.3f on holdout (MAE=%.3f, RMSE=%.3f)",
+            "%s baseline final-fold metrics | train=%d | val=%d | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
             target,
+            n_train,
+            n_val,
             baseline_r2,
             baseline_mae,
             baseline_rmse,
@@ -1457,8 +1483,10 @@ class ModelTrainer:
         mae = mean_absolute_error(y_test, y_pred)
         rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
         logging.info(
-            "%s holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
+            "%s tuned final-fold metrics | train=%d | val=%d | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
             target,
+            n_train,
+            n_val,
             r2,
             mae,
             rmse,
@@ -1539,9 +1567,10 @@ class ModelTrainer:
             return {}
 
         feature_columns = available_numeric + available_categorical
-        train_df, test_df, sorted_df = self._chronological_split(df)
+        train_df, test_df, sorted_df = self._time_series_holdout_split(df)
         X_train = train_df[feature_columns]
         X_test = test_df[feature_columns]
+        n_train, n_val = len(train_df), len(test_df)
 
         y_winner_train = (train_df["game_result"] == "home").astype(int)
         y_winner_test = (test_df["game_result"] == "home").astype(int)
@@ -1599,15 +1628,21 @@ class ModelTrainer:
         baseline_home_r2 = reg_home.score(X_test, y_home_test)
         baseline_away_r2 = reg_away.score(X_test, y_away_test)
         logging.info(
-            "Trained game outcome classifier (baseline), accuracy=%.3f",
+            "Game outcome baseline final-fold metrics | train=%d | val=%d | accuracy=%.3f",
+            n_train,
+            n_val,
             baseline_winner_acc,
         )
         logging.info(
-            "Trained home score regressor (baseline), R^2=%.3f",
+            "Home score baseline final-fold metrics | train=%d | val=%d | R^2=%.3f",
+            n_train,
+            n_val,
             baseline_home_r2,
         )
         logging.info(
-            "Trained away score regressor (baseline), R^2=%.3f",
+            "Away score baseline final-fold metrics | train=%d | val=%d | R^2=%.3f",
+            n_train,
+            n_val,
             baseline_away_r2,
         )
 
@@ -1677,44 +1712,50 @@ class ModelTrainer:
 
         winner_pred = best_clf.predict(X_test)
         winner_proba = best_clf.predict_proba(X_test)[:, 1]
-        winner_accuracy = accuracy_score(y_winner_test, winner_pred)
+        tuned_winner_acc = accuracy_score(y_winner_test, winner_pred)
         try:
-            winner_roc_auc = (
+            tuned_winner_roc_auc = (
                 roc_auc_score(y_winner_test, winner_proba)
                 if len(np.unique(y_winner_test)) > 1
                 else float("nan")
             )
         except ValueError:
-            winner_roc_auc = float("nan")
+            tuned_winner_roc_auc = float("nan")
         try:
-            winner_log_loss = log_loss(y_winner_test, winner_proba, labels=[0, 1])
+            tuned_winner_log_loss = log_loss(y_winner_test, winner_proba, labels=[0, 1])
         except ValueError:
-            winner_log_loss = float("nan")
+            tuned_winner_log_loss = float("nan")
         logging.info(
-            "Game winner holdout metrics | accuracy=%.3f | ROC-AUC=%s | log_loss=%s",
-            winner_accuracy,
-            f"{winner_roc_auc:.3f}" if not np.isnan(winner_roc_auc) else "nan",
-            f"{winner_log_loss:.3f}" if not np.isnan(winner_log_loss) else "nan",
+            "Game outcome tuned final-fold metrics | train=%d | val=%d | accuracy=%.3f | ROC-AUC=%s | log-loss=%s",
+            n_train,
+            n_val,
+            tuned_winner_acc,
+            f"{tuned_winner_roc_auc:.3f}" if not np.isnan(tuned_winner_roc_auc) else "nan",
+            f"{tuned_winner_log_loss:.3f}" if not np.isnan(tuned_winner_log_loss) else "nan",
         )
 
         home_pred = best_reg_home.predict(X_test)
-        home_r2 = best_reg_home.score(X_test, y_home_test)
+        tuned_home_r2 = best_reg_home.score(X_test, y_home_test)
         home_mae = mean_absolute_error(y_home_test, home_pred)
         home_rmse = float(np.sqrt(mean_squared_error(y_home_test, home_pred)))
         logging.info(
-            "Home score holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
-            home_r2,
+            "Home score tuned final-fold metrics | train=%d | val=%d | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
+            n_train,
+            n_val,
+            tuned_home_r2,
             home_mae,
             home_rmse,
         )
 
         away_pred = best_reg_away.predict(X_test)
-        away_r2 = best_reg_away.score(X_test, y_away_test)
+        tuned_away_r2 = best_reg_away.score(X_test, y_away_test)
         away_mae = mean_absolute_error(y_away_test, away_pred)
         away_rmse = float(np.sqrt(mean_squared_error(y_away_test, away_pred)))
         logging.info(
-            "Away score holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
-            away_r2,
+            "Away score tuned final-fold metrics | train=%d | val=%d | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
+            n_train,
+            n_val,
+            tuned_away_r2,
             away_mae,
             away_rmse,
         )
