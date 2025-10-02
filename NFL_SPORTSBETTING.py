@@ -779,7 +779,6 @@ class NFLIngestor:
         )
 
         return first_numeric(score_payload, home_candidates), first_numeric(score_payload, away_candidates)
-
 # ---------------------------------------------------------------------------
 # Feature engineering & modeling
 # ---------------------------------------------------------------------------
@@ -824,6 +823,9 @@ class FeatureBuilder:
             games["home_score"] > games["away_score"], "home",
             np.where(games["home_score"] < games["away_score"], "away", "push"),
         )
+
+        # Derive rolling scoring, rest, and win-rate indicators from historical games.
+        team_game_history = self._compute_team_game_rolling_stats(games)
 
         datasets: Dict[str, pd.DataFrame] = {}
         team_strength: pd.DataFrame
@@ -936,16 +938,62 @@ class FeatureBuilder:
             }
         )
 
+        home_history = team_game_history[team_game_history["is_home"]].drop(
+            columns=["team", "is_home"]
+        )
+        home_history = home_history.rename(
+            columns={
+                "game_id": "game_id",
+                "rolling_points_for": "home_points_for_avg",
+                "rolling_points_against": "home_points_against_avg",
+                "rolling_point_diff": "home_point_diff_avg",
+                "rolling_win_pct": "home_win_pct_recent",
+                "prev_points_for": "home_prev_points_for",
+                "prev_points_against": "home_prev_points_against",
+                "prev_point_diff": "home_prev_point_diff",
+                "rest_days": "home_rest_days",
+            }
+        )
+
+        away_history = team_game_history[~team_game_history["is_home"]].drop(
+            columns=["team", "is_home"]
+        )
+        away_history = away_history.rename(
+            columns={
+                "game_id": "game_id",
+                "rolling_points_for": "away_points_for_avg",
+                "rolling_points_against": "away_points_against_avg",
+                "rolling_point_diff": "away_point_diff_avg",
+                "rolling_win_pct": "away_win_pct_recent",
+                "prev_points_for": "away_prev_points_for",
+                "prev_points_against": "away_prev_points_against",
+                "prev_point_diff": "away_prev_point_diff",
+                "rest_days": "away_rest_days",
+            }
+        )
+
         games_context = (
             games.merge(
                 home_strength,
                 on=["home_team", "season", "week"],
                 how="left",
-            ).merge(
+            )
+            .merge(
                 away_strength,
                 on=["away_team", "season", "week"],
                 how="left",
             )
+            .merge(home_history, on="game_id", how="left")
+            .merge(away_history, on="game_id", how="left")
+        )
+
+        games_context["moneyline_diff"] = games_context["home_moneyline"] - games_context["away_moneyline"]
+        games_context["implied_prob_diff"] = (
+            games_context["home_implied_prob"] - games_context["away_implied_prob"]
+        )
+        games_context["implied_prob_sum"] = (
+            games_context["home_implied_prob"] + games_context["away_implied_prob"]
+
         )
 
         games_context["point_diff"] = games_context["home_score"] - games_context["away_score"]
@@ -1037,6 +1085,130 @@ class FeatureBuilder:
             .reset_index()
         )
         return context
+
+    def _compute_team_game_rolling_stats(self, games: pd.DataFrame) -> pd.DataFrame:
+        """Create rolling scoring, win-rate, and rest indicators for each team game."""
+
+        if games.empty:
+            return pd.DataFrame(
+                columns=[
+                    "game_id",
+                    "team",
+                    "is_home",
+                    "rolling_points_for",
+                    "rolling_points_against",
+                    "rolling_point_diff",
+                    "rolling_win_pct",
+                    "prev_points_for",
+                    "prev_points_against",
+                    "prev_point_diff",
+                    "rest_days",
+                ]
+            )
+
+        games = games.copy()
+        games["start_time"] = pd.to_datetime(games["start_time"])
+
+        home = games[[
+            "game_id",
+            "season",
+            "week",
+            "start_time",
+            "home_team",
+            "home_score",
+            "away_score",
+        ]].rename(
+            columns={
+                "home_team": "team",
+                "home_score": "points_for",
+                "away_score": "points_against",
+            }
+        )
+        home["is_home"] = True
+
+        away = games[[
+            "game_id",
+            "season",
+            "week",
+            "start_time",
+            "away_team",
+            "away_score",
+            "home_score",
+        ]].rename(
+            columns={
+                "away_team": "team",
+                "away_score": "points_for",
+                "home_score": "points_against",
+            }
+        )
+        away["is_home"] = False
+
+        team_games = pd.concat([home, away], ignore_index=True)
+        team_games = team_games.dropna(subset=["team"])  # handle null abbreviations
+
+        team_games = team_games.sort_values([
+            "team",
+            "season",
+            "start_time",
+            "game_id",
+        ]).reset_index(drop=True)
+
+        def compute_group(group: pd.DataFrame) -> pd.DataFrame:
+            group = group.sort_values("start_time").copy()
+            win_flag = np.where(
+                group["points_for"].notna() & group["points_against"].notna(),
+                (group["points_for"] > group["points_against"]).astype(float),
+                np.nan,
+            )
+
+            group["prev_points_for"] = group["points_for"].shift(1)
+            group["prev_points_against"] = group["points_against"].shift(1)
+            group["prev_point_diff"] = (
+                group["prev_points_for"] - group["prev_points_against"]
+            )
+
+            rolling_points_for = (
+                group["points_for"].rolling(window=5, min_periods=1).mean()
+            )
+            rolling_points_against = (
+                group["points_against"].rolling(window=5, min_periods=1).mean()
+            )
+            rolling_point_diff = (
+                (group["points_for"] - group["points_against"]).rolling(window=5, min_periods=1).mean()
+            )
+            rolling_win_pct = (
+                pd.Series(win_flag, index=group.index)
+                .rolling(window=5, min_periods=1)
+                .mean()
+            )
+
+            group["rolling_points_for"] = rolling_points_for.shift(1)
+            group["rolling_points_against"] = rolling_points_against.shift(1)
+            group["rolling_point_diff"] = rolling_point_diff.shift(1)
+            group["rolling_win_pct"] = rolling_win_pct.shift(1)
+
+            rest_days = group["start_time"].diff().dt.total_seconds() / 86400.0
+            group["rest_days"] = rest_days
+
+            return group
+
+        team_games = team_games.groupby(["team", "season"], group_keys=False).apply(compute_group)
+
+        return team_games[
+            [
+                "game_id",
+                "team",
+                "is_home",
+                "rolling_points_for",
+                "rolling_points_against",
+                "rolling_point_diff",
+                "rolling_win_pct",
+                "prev_points_for",
+                "prev_points_against",
+                "prev_point_diff",
+                "rest_days",
+            ]
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1187,6 +1359,9 @@ class ModelTrainer:
             "away_moneyline",
             "home_implied_prob",
             "away_implied_prob",
+            "moneyline_diff",
+            "implied_prob_diff",
+            "implied_prob_sum",
             "home_offense_pass_rating",
             "home_offense_rush_rating",
             "home_defense_pass_rating",
@@ -1195,6 +1370,23 @@ class ModelTrainer:
             "away_offense_rush_rating",
             "away_defense_pass_rating",
             "away_defense_rush_rating",
+            "home_points_for_avg",
+            "home_points_against_avg",
+            "home_point_diff_avg",
+            "home_win_pct_recent",
+            "home_prev_points_for",
+            "home_prev_points_against",
+            "home_prev_point_diff",
+            "home_rest_days",
+            "away_points_for_avg",
+            "away_points_against_avg",
+            "away_point_diff_avg",
+            "away_win_pct_recent",
+            "away_prev_points_for",
+            "away_prev_points_against",
+            "away_prev_point_diff",
+            "away_rest_days",
+
         ]
         categorical_features = ["venue", "day_of_week", "referee", "home_team", "away_team"]
 
@@ -1324,6 +1516,9 @@ def predict_upcoming_games(models: Dict[str, Pipeline], engine: Engine, output_p
             "away_moneyline",
             "home_implied_prob",
             "away_implied_prob",
+            "moneyline_diff",
+            "implied_prob_diff",
+            "implied_prob_sum",
             "home_offense_pass_rating",
             "home_offense_rush_rating",
             "home_defense_pass_rating",
@@ -1332,6 +1527,22 @@ def predict_upcoming_games(models: Dict[str, Pipeline], engine: Engine, output_p
             "away_offense_rush_rating",
             "away_defense_pass_rating",
             "away_defense_rush_rating",
+            "home_points_for_avg",
+            "home_points_against_avg",
+            "home_point_diff_avg",
+            "home_win_pct_recent",
+            "home_prev_points_for",
+            "home_prev_points_against",
+            "home_prev_point_diff",
+            "home_rest_days",
+            "away_points_for_avg",
+            "away_points_against_avg",
+            "away_point_diff_avg",
+            "away_win_pct_recent",
+            "away_prev_points_for",
+            "away_prev_points_against",
+            "away_prev_point_diff",
+            "away_rest_days",
             "venue",
             "day_of_week",
             "referee",
