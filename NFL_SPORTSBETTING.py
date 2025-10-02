@@ -789,6 +789,7 @@ class NFLIngestor:
         )
 
         return first_numeric(score_payload, home_candidates), first_numeric(score_payload, away_candidates)
+
 # ---------------------------------------------------------------------------
 # Feature engineering & modeling
 # ---------------------------------------------------------------------------
@@ -1064,6 +1065,7 @@ class FeatureBuilder:
         cols = ["season", "week", "team", "offense_pass_rating", "offense_rush_rating", "defense_pass_rating", "defense_rush_rating"]
 
         return grouped[cols]
+
         stats = player_stats.copy()
 
         numeric_cols = [
@@ -1217,6 +1219,7 @@ class FeatureBuilder:
         ratings[rating_cols] = ratings[rating_cols].fillna(0)
 
         return ratings
+
 
     def _compute_contextual_averages(self, player_stats: pd.DataFrame) -> pd.DataFrame:
         if player_stats.empty:
@@ -1389,7 +1392,6 @@ class ModelTrainer:
         self.engine = engine
         self.feature_builder = FeatureBuilder(engine)
 
-
     def _sort_by_time(self, df: pd.DataFrame) -> pd.DataFrame:
         if "start_time" in df.columns:
             return df.sort_values("start_time")
@@ -1516,16 +1518,15 @@ class ModelTrainer:
             return None
 
         feature_columns = available_numeric + available_categorical
+
         X = df[feature_columns]
         y = df[target]
-
 
         train_df, test_df, sorted_df = self._chronological_split(df)
         X_train = train_df[feature_columns]
         y_train = train_df[target]
         X_test = test_df[feature_columns]
         y_test = test_df[target]
-
 
         transformers = []
         if available_numeric:
@@ -1558,6 +1559,7 @@ class ModelTrainer:
             ("regressor", GradientBoostingRegressor(random_state=42)),
         ])
 
+
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
         model.fit(X_train, y_train)
         score = model.score(X_test, y_test)
@@ -1581,32 +1583,32 @@ class ModelTrainer:
                 exc,
             )
             model.fit(X_train, y_train)
-            score = model.score(X_test, y_test)
-            logging.info("Trained %s model without tuning, R^2=%.3f", target, score)
-            return model
+            best_model = model
+        else:
+            search = RandomizedSearchCV(
+                estimator=model,
+                param_distributions=self._gb_param_grid("regressor__"),
+                n_iter=10,
+                scoring="neg_mean_absolute_error",
+                cv=cv,
+                random_state=42,
+                n_jobs=-1,
+            )
+            search.fit(X_train, y_train)
+            best_model: Pipeline = search.best_estimator_
+            logging.info(
+                "Best parameters for %s model: %s (CV MAE=%.3f)",
+                target,
+                search.best_params_,
+                -search.best_score_,
+            )
 
-        search = RandomizedSearchCV(
-            estimator=model,
-            param_distributions=self._gb_param_grid("regressor__"),
-            n_iter=10,
-            scoring="neg_mean_absolute_error",
-            cv=cv,
-            random_state=42,
-            n_jobs=-1,
-        )
-        search.fit(X_train, y_train)
-        best_model: Pipeline = search.best_estimator_
-        logging.info(
-            "Best parameters for %s model: %s (CV MAE=%.3f)",
-            target,
-            search.best_params_,
-            -search.best_score_,
-        )
 
         y_pred = best_model.predict(X_test)
         r2 = best_model.score(X_test, y_test)
         mae = mean_absolute_error(y_test, y_pred)
-        rmse = mean_squared_error(y_test, y_pred, squared=False)
+        rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+
         logging.info(
             "%s holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
             target,
@@ -1749,6 +1751,7 @@ class ModelTrainer:
             ("regressor", GradientBoostingRegressor(random_state=42)),
         ])
 
+
         X_train, X_test, y_train, y_test = train_test_split(X, y_winner, test_size=0.2, random_state=42)
         clf.fit(X_train, y_train)
         clf_score = clf.score(X_test, y_test)
@@ -1772,6 +1775,10 @@ class ModelTrainer:
             clf.fit(X_train, y_winner_train)
             reg_home.fit(X_train, y_home_train)
             reg_away.fit(X_train, y_away_train)
+            best_clf = clf
+            best_reg_home = reg_home
+            best_reg_away = reg_away
+
         else:
             clf_search = RandomizedSearchCV(
                 estimator=clf,
@@ -1783,7 +1790,10 @@ class ModelTrainer:
                 n_jobs=-1,
             )
             clf_search.fit(X_train, y_winner_train)
+            best_clf: Pipeline = clf_search.best_estimator_
+
             clf = clf_search.best_estimator_
+
             logging.info(
                 "Best parameters for game winner model: %s (CV ROC-AUC=%.3f)",
                 clf_search.best_params_,
@@ -1800,7 +1810,10 @@ class ModelTrainer:
                 n_jobs=-1,
             )
             reg_home_search.fit(X_train, y_home_train)
+            best_reg_home: Pipeline = reg_home_search.best_estimator_
+
             reg_home = reg_home_search.best_estimator_
+
             logging.info(
                 "Best parameters for home score model: %s (CV MAE=%.3f)",
                 reg_home_search.best_params_,
@@ -1817,15 +1830,16 @@ class ModelTrainer:
                 n_jobs=-1,
             )
             reg_away_search.fit(X_train, y_away_train)
-            reg_away = reg_away_search.best_estimator_
+            best_reg_away: Pipeline = reg_away_search.best_estimator_
+
             logging.info(
                 "Best parameters for away score model: %s (CV MAE=%.3f)",
                 reg_away_search.best_params_,
                 -reg_away_search.best_score_,
             )
 
-        winner_pred = clf.predict(X_test)
-        winner_proba = clf.predict_proba(X_test)[:, 1]
+        winner_pred = best_clf.predict(X_test)
+        winner_proba = best_clf.predict_proba(X_test)[:, 1]
         winner_accuracy = accuracy_score(y_winner_test, winner_pred)
         try:
             winner_roc_auc = (
@@ -1846,10 +1860,11 @@ class ModelTrainer:
             f"{winner_log_loss:.3f}" if not np.isnan(winner_log_loss) else "nan",
         )
 
-        home_pred = reg_home.predict(X_test)
-        home_r2 = reg_home.score(X_test, y_home_test)
+        home_pred = best_reg_home.predict(X_test)
+        home_r2 = best_reg_home.score(X_test, y_home_test)
         home_mae = mean_absolute_error(y_home_test, home_pred)
-        home_rmse = mean_squared_error(y_home_test, home_pred, squared=False)
+        home_rmse = float(np.sqrt(mean_squared_error(y_home_test, home_pred)))
+
         logging.info(
             "Home score holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
             home_r2,
@@ -1857,10 +1872,11 @@ class ModelTrainer:
             home_rmse,
         )
 
-        away_pred = reg_away.predict(X_test)
-        away_r2 = reg_away.score(X_test, y_away_test)
+        away_pred = best_reg_away.predict(X_test)
+        away_r2 = best_reg_away.score(X_test, y_away_test)
         away_mae = mean_absolute_error(y_away_test, away_pred)
-        away_rmse = mean_squared_error(y_away_test, away_pred, squared=False)
+        away_rmse = float(np.sqrt(mean_squared_error(y_away_test, away_pred)))
+
         logging.info(
             "Away score holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
             away_r2,
@@ -1869,14 +1885,15 @@ class ModelTrainer:
         )
 
         X_full = sorted_df[feature_columns]
-        clf.fit(X_full, (sorted_df["game_result"] == "home").astype(int))
-        reg_home.fit(X_full, sorted_df["home_score"])
-        reg_away.fit(X_full, sorted_df["away_score"])
+        best_clf.fit(X_full, (sorted_df["game_result"] == "home").astype(int))
+        best_reg_home.fit(X_full, sorted_df["home_score"])
+        best_reg_away.fit(X_full, sorted_df["away_score"])
 
         return {
-            "game_winner": clf,
-            "home_points": reg_home,
-            "away_points": reg_away,
+            "game_winner": best_clf,
+            "home_points": best_reg_home,
+            "away_points": best_reg_away,
+
         }
 
 
