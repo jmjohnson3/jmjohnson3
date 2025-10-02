@@ -31,6 +31,9 @@ from requests import HTTPError
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.impute import SimpleImputer
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score,
     log_loss,
@@ -788,7 +791,6 @@ class NFLIngestor:
 
         return first_numeric(score_payload, home_candidates), first_numeric(score_payload, away_candidates)
 
-
 # ---------------------------------------------------------------------------
 # Feature engineering & modeling
 # ---------------------------------------------------------------------------
@@ -1403,6 +1405,7 @@ class ModelTrainer:
         r2 = best_model.score(X_test, y_test)
         mae = mean_absolute_error(y_test, y_pred)
         rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+
         logging.info(
             "%s holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
             target,
@@ -1456,6 +1459,7 @@ class ModelTrainer:
             "away_prev_points_against",
             "away_prev_point_diff",
             "away_rest_days",
+
         ]
         categorical_features = ["venue", "day_of_week", "referee", "home_team", "away_team"]
 
@@ -1486,6 +1490,7 @@ class ModelTrainer:
             return {}
 
         feature_columns = available_numeric + available_categorical
+
 
         train_df, test_df, sorted_df = self._chronological_split(df)
         X_train = train_df[feature_columns]
@@ -1563,6 +1568,7 @@ class ModelTrainer:
         best_reg_home = reg_home
         best_reg_away = reg_away
 
+
         try:
             cv = self._build_time_series_cv(len(X_train))
         except ValueError as exc:
@@ -1570,6 +1576,7 @@ class ModelTrainer:
                 "Skipping hyperparameter tuning for game models due to insufficient data: %s",
                 exc,
             )
+
         else:
             clf_search = RandomizedSearchCV(
                 estimator=clf,
@@ -1599,6 +1606,7 @@ class ModelTrainer:
             )
             reg_home_search.fit(X_train, y_home_train)
             best_reg_home: Pipeline = reg_home_search.best_estimator_
+
             logging.info(
                 "Best parameters for home score model: %s (CV MAE=%.3f)",
                 reg_home_search.best_params_,
