@@ -1,0 +1,3960 @@
+#!/usr/bin/env python3
+"""Comprehensive NFL betting analytics and prediction pipeline.
+
+This script ingests game, player, and odds data from the MySportsFeeds and The Odds
+API services, persists the information to PostgreSQL, and then builds machine
+learning models to predict player performance and game outcomes.
+
+The workflow is designed to run incrementally: the first execution ingests all
+available data for the configured seasons, while subsequent runs only request new
+games and odds. The machine learning models incorporate contextual features such
+as venue effects, day-of-week trends, officiating crews, weather, and team unit
+strengths (rush/pass offense & defense) to deliver rich predictive insights that
+can be used to identify profitable betting opportunities.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime as dt
+import json
+import logging
+import math
+import os
+import uuid
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+import requests
+from requests import HTTPError
+from sklearn.base import clone
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import (
+    GradientBoostingClassifier,
+    GradientBoostingRegressor,
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+    StackingClassifier,
+    StackingRegressor,
+)
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score,
+    brier_score_loss,
+    log_loss,
+    mean_absolute_error,
+    mean_squared_error,
+    roc_auc_score,
+)
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sqlalchemy import (
+    JSON,
+    Column,
+    DateTime,
+    Float,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    UniqueConstraint,
+    create_engine,
+    func,
+    select,
+)
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+API_PREFIX_NFL = "https://api.mysportsfeeds.com/v2.1/pull/nfl"
+NFL_SEASONS = ["2024-regular", "2025-regular"]
+
+NFL_API_USER = "4359aa1b-cc29-4647-a3e5-7314e2"
+NFL_API_PASS = "MYSPORTSFEEDS"
+
+ODDS_API_KEY = "5b6f0290e265c3329b3ed27897d79eaf"
+ODDS_BASE = "https://api.the-odds-api.com/v4"
+NFL_SPORT_KEY = "americanfootball_nfl"
+ODDS_REGIONS = ["us"]
+ODDS_FORMAT = "american"
+
+DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+
+# ---------------------------------------------------------------------------
+# Static data helpers
+# ---------------------------------------------------------------------------
+
+
+TEAM_NAME_TO_ABBR = {
+    "arizona cardinals": "ARI",
+    "atlanta falcons": "ATL",
+    "baltimore ravens": "BAL",
+    "buffalo bills": "BUF",
+    "carolina panthers": "CAR",
+    "chicago bears": "CHI",
+    "cincinnati bengals": "CIN",
+    "cleveland browns": "CLE",
+    "dallas cowboys": "DAL",
+    "denver broncos": "DEN",
+    "detroit lions": "DET",
+    "green bay packers": "GB",
+    "houston texans": "HOU",
+    "indianapolis colts": "IND",
+    "jacksonville jaguars": "JAX",
+    "jacksonville jaguar": "JAX",
+    "kansas city chiefs": "KC",
+    "las vegas raiders": "LV",
+    "oakland raiders": "LV",
+    "los angeles chargers": "LAC",
+    "la chargers": "LAC",
+    "los angeles rams": "LAR",
+    "la rams": "LAR",
+    "miami dolphins": "MIA",
+    "minnesota vikings": "MIN",
+    "new england patriots": "NE",
+    "new orleans saints": "NO",
+    "new york giants": "NYG",
+    "ny giants": "NYG",
+    "new york jets": "NYJ",
+    "ny jets": "NYJ",
+    "philadelphia eagles": "PHI",
+    "pittsburgh steelers": "PIT",
+    "san francisco 49ers": "SF",
+    "sf 49ers": "SF",
+    "seattle seahawks": "SEA",
+    "tampa bay buccaneers": "TB",
+    "tennessee titans": "TEN",
+    "washington commanders": "WAS",
+    "washington football team": "WAS",
+    "washington redskins": "WAS",
+    "st. louis rams": "LAR",
+    "st louis rams": "LAR",
+}
+
+TEAM_ABBR_CANONICAL = {
+    "ARI": "arizona cardinals",
+    "ATL": "atlanta falcons",
+    "BAL": "baltimore ravens",
+    "BUF": "buffalo bills",
+    "CAR": "carolina panthers",
+    "CHI": "chicago bears",
+    "CIN": "cincinnati bengals",
+    "CLE": "cleveland browns",
+    "DAL": "dallas cowboys",
+    "DEN": "denver broncos",
+    "DET": "detroit lions",
+    "GB": "green bay packers",
+    "HOU": "houston texans",
+    "IND": "indianapolis colts",
+    "JAX": "jacksonville jaguars",
+    "KC": "kansas city chiefs",
+    "LV": "las vegas raiders",
+    "LAC": "los angeles chargers",
+    "LAR": "los angeles rams",
+    "MIA": "miami dolphins",
+    "MIN": "minnesota vikings",
+    "NE": "new england patriots",
+    "NO": "new orleans saints",
+    "NYG": "new york giants",
+    "NYJ": "new york jets",
+    "PHI": "philadelphia eagles",
+    "PIT": "pittsburgh steelers",
+    "SF": "san francisco 49ers",
+    "SEA": "seattle seahawks",
+    "TB": "tampa bay buccaneers",
+    "TEN": "tennessee titans",
+    "WAS": "washington commanders",
+}
+
+TEAM_ABBR_ALIASES = {
+    "LA": "LAR",
+    "STL": "LAR",
+    "SD": "LAC",
+}
+
+TEAM_TIMEZONES = {
+    "ARI": "America/Phoenix",
+    "ATL": "America/New_York",
+    "BAL": "America/New_York",
+    "BUF": "America/New_York",
+    "CAR": "America/New_York",
+    "CHI": "America/Chicago",
+    "CIN": "America/New_York",
+    "CLE": "America/New_York",
+    "DAL": "America/Chicago",
+    "DEN": "America/Denver",
+    "DET": "America/Detroit",
+    "GB": "America/Chicago",
+    "HOU": "America/Chicago",
+    "IND": "America/Indiana/Indianapolis",
+    "JAX": "America/New_York",
+    "KC": "America/Chicago",
+    "LV": "America/Los_Angeles",
+    "LAC": "America/Los_Angeles",
+    "LAR": "America/Los_Angeles",
+    "MIA": "America/New_York",
+    "MIN": "America/Chicago",
+    "NE": "America/New_York",
+    "NO": "America/Chicago",
+    "NYG": "America/New_York",
+    "NYJ": "America/New_York",
+    "PHI": "America/New_York",
+    "PIT": "America/New_York",
+    "SEA": "America/Los_Angeles",
+    "SF": "America/Los_Angeles",
+    "TB": "America/New_York",
+    "TEN": "America/Chicago",
+    "WAS": "America/New_York",
+}
+
+_NULL_TEAM_TOKENS = {"", "none", "null", "nan", "tbd", "tba", "n/a", "na", "--"}
+
+TEAM_MASCOT_TO_ABBR = {
+    "cardinals": "ARI",
+    "falcons": "ATL",
+    "ravens": "BAL",
+    "bills": "BUF",
+    "panthers": "CAR",
+    "bears": "CHI",
+    "bengals": "CIN",
+    "browns": "CLE",
+    "cowboys": "DAL",
+    "broncos": "DEN",
+    "lions": "DET",
+    "packers": "GB",
+    "texans": "HOU",
+    "colts": "IND",
+    "jaguars": "JAX",
+    "chiefs": "KC",
+    "raiders": "LV",
+    "chargers": "LAC",
+    "rams": "LAR",
+    "dolphins": "MIA",
+    "vikings": "MIN",
+    "patriots": "NE",
+    "saints": "NO",
+    "giants": "NYG",
+    "jets": "NYJ",
+    "eagles": "PHI",
+    "steelers": "PIT",
+    "49ers": "SF",
+    "niners": "SF",
+    "seahawks": "SEA",
+    "buccaneers": "TB",
+    "bucs": "TB",
+    "titans": "TEN",
+    "commanders": "WAS",
+    "football team": "WAS",
+}
+
+
+def _sanitize_team_key(text: str) -> str:
+    cleaned = []
+    for ch in text.lower():
+        if ch.isalnum() or ch.isspace():
+            cleaned.append(ch)
+    normalized = " ".join("".join(cleaned).split())
+    return normalized
+
+
+def normalize_team_abbr(value: Any) -> Optional[str]:
+    """Convert free-form team descriptors into standard three-letter abbreviations."""
+
+    if value is None:
+        return None
+    if isinstance(value, float) and np.isnan(value):  # type: ignore[arg-type]
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    lowered = text.lower().strip()
+    if lowered in _NULL_TEAM_TOKENS:
+        return None
+
+    candidate = text.upper().replace(" ", "")
+    if len(candidate) <= 4 and candidate.isalpha():
+        if candidate in TEAM_ABBR_CANONICAL:
+            return candidate
+        if candidate in TEAM_ABBR_ALIASES:
+            return TEAM_ABBR_ALIASES[candidate]
+        # Some feeds already provide three-letter abbreviations with spaces
+        spaced_candidate = " ".join(candidate)
+        if spaced_candidate in TEAM_NAME_TO_ABBR:
+            return TEAM_NAME_TO_ABBR[spaced_candidate]
+
+    sanitized = _sanitize_team_key(text)
+    if not sanitized:
+        return None
+
+    if sanitized in TEAM_NAME_TO_ABBR:
+        return TEAM_NAME_TO_ABBR[sanitized]
+
+    sanitized_candidate = sanitized.replace(" ", "").upper()
+    if sanitized_candidate in TEAM_ABBR_ALIASES:
+        return TEAM_ABBR_ALIASES[sanitized_candidate]
+
+    compact_key = sanitized.replace(" ", "")
+    if compact_key in TEAM_NAME_TO_ABBR:
+        return TEAM_NAME_TO_ABBR[compact_key]
+
+    for abbr, canonical in TEAM_ABBR_CANONICAL.items():
+        if sanitized == canonical:
+            return abbr
+        if canonical in sanitized:
+            return abbr
+
+    if sanitized in TEAM_MASCOT_TO_ABBR:
+        return TEAM_MASCOT_TO_ABBR[sanitized]
+
+    # As a last resort, try to map by taking the first letter of each token
+    tokens = sanitized.split()
+    if len(tokens) >= 2:
+        initials = "".join(token[0] for token in tokens)
+        if initials.upper() in TEAM_ABBR_CANONICAL:
+            return initials.upper()
+
+    if len(candidate) <= 4 and candidate.isalpha():
+        return candidate
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Supplemental data loading
+# ---------------------------------------------------------------------------
+
+
+class SupplementalDataLoader:
+    """Loads optional injury, depth chart, advanced metric, and weather feeds."""
+
+    def __init__(self, config: NFLConfig):
+        self.injury_records = self._load_records(config.injury_report_path)
+        self.depth_chart_records = self._load_records(config.depth_chart_path)
+        self.advanced_records = self._load_records(config.advanced_metrics_path)
+        self.weather_records = self._load_records(config.weather_forecast_path)
+
+        self.injuries_by_game = self._index_records(self.injury_records, "game_id")
+        self.injuries_by_team = self._index_records(self.injury_records, "team")
+        self.depth_by_team = self._index_records(self.depth_chart_records, "team")
+        self.weather_by_game = self._index_records(self.weather_records, "game_id")
+        self.advanced_by_key: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
+        for record in self.advanced_records:
+            season = record.get("season")
+            week = record.get("week")
+            team = normalize_team_abbr(record.get("team"))
+            if season and week is not None and team:
+                self.advanced_by_key[(str(season), int(week), team)] = record
+
+    @staticmethod
+    def _load_records(path: Optional[str]) -> List[Dict[str, Any]]:
+        if not path:
+            return []
+        file_path = Path(path)
+        if not file_path.exists():
+            logging.warning("Supplemental data file %s not found", file_path)
+            return []
+        try:
+            if file_path.suffix.lower() in {".json", ".geojson"}:
+                with file_path.open("r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                if isinstance(payload, dict):
+                    if "items" in payload and isinstance(payload["items"], list):
+                        return [dict(item) for item in payload["items"]]
+                    if "data" in payload and isinstance(payload["data"], list):
+                        return [dict(item) for item in payload["data"]]
+                    return [dict(payload)]
+                if isinstance(payload, list):
+                    return [dict(item) for item in payload]
+                logging.warning("Unsupported JSON format in %s", file_path)
+                return []
+            frame = pd.read_csv(file_path)
+            return frame.to_dict("records")
+        except Exception:  # pragma: no cover - defensive logging
+            logging.exception("Unable to load supplemental data from %s", file_path)
+            return []
+
+    @staticmethod
+    def _index_records(records: List[Dict[str, Any]], key: str) -> Dict[str, List[Dict[str, Any]]]:
+        index: Dict[str, List[Dict[str, Any]]] = {}
+        for record in records:
+            raw_value = record.get(key)
+            if raw_value is None:
+                continue
+            if key == "team":
+                normalized = normalize_team_abbr(raw_value)
+            else:
+                normalized = str(raw_value)
+            if not normalized:
+                continue
+            index.setdefault(normalized, []).append(record)
+        return index
+
+    def injuries_for_game(
+        self, game_id: str, home_team: Optional[str], away_team: Optional[str]
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        game_records = list(self.injuries_by_game.get(str(game_id), []))
+        if not game_records:
+            for team in (home_team, away_team):
+                if not team:
+                    continue
+                team_records = self.injuries_by_team.get(normalize_team_abbr(team), [])
+                game_records.extend(team_records)
+
+        normalized_rows: List[Dict[str, Any]] = []
+        for record in game_records:
+            team = normalize_team_abbr(record.get("team"))
+            player_name = record.get("player_name") or record.get("name")
+            status = record.get("status")
+            practice_status = record.get("practice_status") or record.get("practice")
+            description = record.get("description") or record.get("details")
+            report_time = record.get("report_time") or record.get("updated_at")
+            normalized_rows.append(
+                {
+                    "injury_id": record.get("injury_id")
+                    or record.get("id")
+                    or uuid.uuid4().hex,
+                    "game_id": str(game_id),
+                    "team": team,
+                    "player_name": player_name,
+                    "status": status,
+                    "practice_status": practice_status,
+                    "description": description,
+                    "report_time": parse_dt(report_time) if report_time else None,
+                }
+            )
+
+        summary_parts = [
+            f"{row['player_name']}({row['status']})"
+            for row in normalized_rows
+            if row.get("player_name") and row.get("status")
+        ]
+        summary: Optional[str] = None
+        if summary_parts:
+            preview = summary_parts[:6]
+            summary = ", ".join(preview)
+            remaining = len(summary_parts) - len(preview)
+            if remaining > 0:
+                summary += f" +{remaining} more"
+        return normalized_rows, summary
+
+    def depth_chart_rows(self, team: str) -> List[Dict[str, Any]]:
+        normalized_team = normalize_team_abbr(team)
+        records = self.depth_by_team.get(normalized_team, [])
+        rows: List[Dict[str, Any]] = []
+        for record in records:
+            rows.append(
+                {
+                    "depth_id": record.get("depth_id")
+                    or record.get("id")
+                    or uuid.uuid4().hex,
+                    "team": normalized_team,
+                    "position": record.get("position"),
+                    "player_id": str(record.get("player_id") or record.get("id") or ""),
+                    "player_name": record.get("player_name") or record.get("name"),
+                    "rank": record.get("rank") or record.get("depth") or record.get("order"),
+                    "updated_at": parse_dt(record.get("updated_at"))
+                    if record.get("updated_at")
+                    else parse_dt(record.get("timestamp")),
+                }
+            )
+        return rows
+
+    def advanced_metrics(
+        self, season: Optional[str], week: Optional[int], team: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        if not season or week is None or not team:
+            return None
+        return self.advanced_by_key.get((str(season), int(week), normalize_team_abbr(team)))
+
+    def weather_override(self, game_id: str) -> Optional[Dict[str, Any]]:
+        records = self.weather_by_game.get(str(game_id), [])
+        if not records:
+            return None
+        latest = max(records, key=lambda rec: rec.get("updated_at") or "")
+        output = dict(latest)
+        if "temperature_f" not in output and "temperature" in output:
+            output["temperature_f"] = NFLIngestor._extract_temperature_fahrenheit(
+                output.get("temperature")
+            )
+        return output
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+
+def default_now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def parse_dt(value: str) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+@dataclasses.dataclass
+class NFLConfig:
+    pg_user: str = os.getenv("PGUSER", "josh")
+    pg_password: str = os.getenv("PGPASSWORD", "password")
+    pg_host: str = os.getenv("PGHOST", "localhost")
+    pg_port: str = os.getenv("PGPORT", "5432")
+    pg_database: str = os.getenv("PGDATABASE", "nfl")
+
+    seasons: Tuple[str, ...] = tuple(NFL_SEASONS)
+    log_level: str = DEFAULT_LOG_LEVEL
+    injury_report_path: Optional[str] = os.getenv("NFL_INJURY_PATH")
+    depth_chart_path: Optional[str] = os.getenv("NFL_DEPTH_PATH")
+    advanced_metrics_path: Optional[str] = os.getenv("NFL_ADVANCED_PATH")
+    weather_forecast_path: Optional[str] = os.getenv("NFL_FORECAST_PATH")
+
+    @property
+    def pg_url(self) -> str:
+        return (
+            f"postgresql+psycopg2://{self.pg_user}:{self.pg_password}"
+            f"@{self.pg_host}:{self.pg_port}/{self.pg_database}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Database schema & helpers
+# ---------------------------------------------------------------------------
+
+
+class NFLDatabase:
+    """Encapsulates PostgreSQL persistence for NFL data."""
+
+    def __init__(self, engine: Engine):
+        self.engine = engine
+        self.meta = MetaData()
+        self._define_tables()
+        self.meta.create_all(self.engine)
+
+    def _define_tables(self) -> None:
+        self.games = Table(
+            "nfl_games",
+            self.meta,
+            Column("game_id", String, primary_key=True),
+            Column("season", String, nullable=False),
+            Column("week", Integer),
+            Column("start_time", DateTime(timezone=True)),
+            Column("venue", String),
+            Column("city", String),
+            Column("state", String),
+            Column("country", String),
+            Column("surface", String),
+            Column("day_of_week", String),
+            Column("referee", String),
+            Column("temperature_f", Float),
+            Column("weather_conditions", String),
+            Column("wind_mph", Float),
+            Column("humidity", Float),
+            Column("injury_summary", String),
+            Column("home_team", String),
+            Column("away_team", String),
+            Column("home_score", Integer),
+            Column("away_score", Integer),
+            Column("status", String),
+            Column("home_moneyline", Float),
+            Column("away_moneyline", Float),
+            Column("home_implied_prob", Float),
+            Column("away_implied_prob", Float),
+            Column("odds_updated", DateTime(timezone=True)),
+            Column("ingested_at", DateTime(timezone=True), default=default_now_utc),
+        )
+
+        self.player_stats = Table(
+            "nfl_player_stats",
+            self.meta,
+            Column("game_id", String, nullable=False),
+            Column("player_id", String, nullable=False),
+            Column("player_name", String),
+            Column("team", String),
+            Column("position", String),
+            Column("rushing_attempts", Float),
+            Column("rushing_yards", Float),
+            Column("rushing_tds", Float),
+            Column("receiving_targets", Float),
+            Column("receptions", Float),
+            Column("receiving_yards", Float),
+            Column("receiving_tds", Float),
+            Column("passing_attempts", Float),
+            Column("passing_completions", Float),
+            Column("passing_yards", Float),
+            Column("passing_tds", Float),
+            Column("fantasy_points", Float),
+            Column("snap_count", Float),
+            Column("ingested_at", DateTime(timezone=True), default=default_now_utc),
+            UniqueConstraint("game_id", "player_id", name="uq_player_game"),
+        )
+
+        self.team_unit_ratings = Table(
+            "nfl_team_unit_ratings",
+            self.meta,
+            Column("season", String, nullable=False),
+            Column("team", String, nullable=False),
+            Column("week", Integer, nullable=False),
+            Column("offense_pass_rating", Float),
+            Column("offense_rush_rating", Float),
+            Column("defense_pass_rating", Float),
+            Column("defense_rush_rating", Float),
+            Column("updated_at", DateTime(timezone=True), default=default_now_utc),
+            UniqueConstraint("season", "team", "week", name="uq_team_week"),
+        )
+
+        self.model_predictions = Table(
+            "nfl_predictions",
+            self.meta,
+            Column("prediction_id", String, primary_key=True),
+            Column("game_id", String, nullable=False),
+            Column("entity_type", String, nullable=False),
+            Column("entity_id", String, nullable=False),
+            Column("prediction_target", String, nullable=False),
+            Column("prediction_value", Float),
+            Column("model_version", String),
+            Column("features", JSON),
+            Column("created_at", DateTime(timezone=True), default=default_now_utc),
+        )
+
+        self.injury_reports = Table(
+            "nfl_injury_reports",
+            self.meta,
+            Column("injury_id", String, primary_key=True),
+            Column("game_id", String),
+            Column("team", String, nullable=False),
+            Column("player_name", String),
+            Column("status", String),
+            Column("practice_status", String),
+            Column("description", String),
+            Column("report_time", DateTime(timezone=True)),
+            Column("ingested_at", DateTime(timezone=True), default=default_now_utc),
+        )
+
+        self.depth_charts = Table(
+            "nfl_depth_charts",
+            self.meta,
+            Column("depth_id", String, primary_key=True),
+            Column("team", String, nullable=False),
+            Column("position", String, nullable=False),
+            Column("player_id", String),
+            Column("player_name", String),
+            Column("rank", Integer),
+            Column("updated_at", DateTime(timezone=True)),
+            Column("ingested_at", DateTime(timezone=True), default=default_now_utc),
+        )
+
+        self.team_advanced_metrics = Table(
+            "nfl_team_advanced_metrics",
+            self.meta,
+            Column("metric_id", String, primary_key=True),
+            Column("season", String, nullable=False),
+            Column("week", Integer, nullable=False),
+            Column("team", String, nullable=False),
+            Column("pace_seconds_per_play", Float),
+            Column("offense_epa", Float),
+            Column("defense_epa", Float),
+            Column("offense_success_rate", Float),
+            Column("defense_success_rate", Float),
+            Column("travel_penalty", Float),
+            Column("rest_penalty", Float),
+            Column("weather_adjustment", Float),
+            Column("created_at", DateTime(timezone=True), default=default_now_utc),
+            UniqueConstraint("season", "week", "team", name="uq_adv_metrics_team_week"),
+        )
+
+        self.model_backtests = Table(
+            "nfl_model_backtests",
+            self.meta,
+            Column("run_id", String, nullable=False),
+            Column("model_name", String, nullable=False),
+            Column("metric_name", String, nullable=False),
+            Column("metric_value", Float, nullable=False),
+            Column("sample_size", Integer),
+            Column("created_at", DateTime(timezone=True), default=default_now_utc),
+        )
+
+    # ------------------------------------------------------------------
+    # Write helpers
+    # ------------------------------------------------------------------
+
+    def upsert_rows(
+        self,
+        table: Table,
+        rows: Iterable[Dict[str, Any]],
+        conflict_cols: List[str],
+        update_columns: Optional[Iterable[str]] = None,
+    ) -> None:
+        if not rows:
+            return
+        stmt = insert(table).values(list(rows))
+        if update_columns is None:
+            update_cols = {
+                col.name: stmt.excluded[col.name]
+                for col in table.columns
+                if col.name not in conflict_cols
+            }
+        else:
+            valid_columns = {
+                col
+                for col in update_columns
+                if col in table.c.keys() and col not in conflict_cols
+            }
+            update_cols = {col: stmt.excluded[col] for col in valid_columns}
+
+        if update_cols:
+            stmt = stmt.on_conflict_do_update(index_elements=conflict_cols, set_=update_cols)
+        else:
+            stmt = stmt.on_conflict_do_nothing(index_elements=conflict_cols)
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(stmt)
+        except SQLAlchemyError:
+            logging.exception("Failed to upsert rows into %s", table.name)
+            raise
+
+    def fetch_existing_game_ids(self) -> set[str]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(select(self.games.c.game_id)).fetchall()
+        return {row[0] for row in rows}
+
+    def fetch_games_with_player_stats(self) -> set[str]:
+        """Return the set of game IDs that already have player statistics stored."""
+
+        with self.engine.begin() as conn:
+            rows = conn.execute(select(self.player_stats.c.game_id).distinct()).fetchall()
+        return {row[0] for row in rows}
+
+    def latest_team_rating_week(self, season: str) -> Optional[int]:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(func.max(self.team_unit_ratings.c.week)).where(self.team_unit_ratings.c.season == season)
+            ).scalar()
+        return row
+
+    def record_backtest_metrics(
+        self,
+        run_id: str,
+        model_name: str,
+        metrics: Dict[str, float],
+        sample_size: Optional[int] = None,
+    ) -> None:
+        if not metrics:
+            return
+        rows = [
+            {
+                "run_id": run_id,
+                "model_name": model_name,
+                "metric_name": metric,
+                "metric_value": float(value),
+                "sample_size": sample_size,
+            }
+            for metric, value in metrics.items()
+        ]
+        with self.engine.begin() as conn:
+            conn.execute(self.model_backtests.insert(), rows)
+
+
+# ---------------------------------------------------------------------------
+# API clients
+# ---------------------------------------------------------------------------
+
+
+class MySportsFeedsClient:
+    def __init__(self, user: str, password: str, timeout: int = 30):
+        self.auth = (user, password)
+        self.timeout = timeout
+
+    def _request(self, endpoint: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        url = f"{API_PREFIX_NFL}/{endpoint}"
+        logging.debug("Requesting MySportsFeeds endpoint %s", url)
+        resp = requests.get(url, params=params, auth=self.auth, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def fetch_games(self, season: str) -> List[Dict[str, Any]]:
+        """Fetch the schedule for a season, retrying with alternative filters."""
+
+        base_params: Dict[str, Any] = {"limit": 500}
+        attempts: Tuple[Optional[str], ...] = (
+            "completed,upcoming",
+            "final,inprogress,scheduled",
+            None,
+        )
+
+        for status_filter in attempts:
+            params = dict(base_params)
+            if status_filter:
+                params["status"] = status_filter
+
+            data = self._request(f"{season}/games.json", params=params)
+            games = data.get("games", [])
+            if games:
+                if status_filter and status_filter != attempts[0]:
+                    logging.debug(
+                        "Fetched %d games for %s after retrying with status filter '%s'",
+                        len(games),
+                        season,
+                        status_filter,
+                    )
+                return games
+
+        logging.debug(
+            "No games returned for %s even after retrying with multiple status filters",
+            season,
+        )
+        return []
+
+    def fetch_game_boxscore(self, season: str, game_id: str) -> Dict[str, Any]:
+        return self._request(f"{season}/games/{game_id}/boxscore.json")
+
+    def fetch_player_gamelogs(self, season: str, game_id: str) -> List[Dict[str, Any]]:
+        try:
+            data = self._request(
+                f"{season}/games/{game_id}/player_gamelogs.json",
+                params={"stats": "Rushing,Receiving,Passing,Fumbles"},
+            )
+        except HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 404:
+                logging.debug(
+                    "No player gamelogs found for season %s game %s (HTTP 404)",
+                    season,
+                    game_id,
+                )
+                return []
+            raise
+        return data.get("gamelogs", [])
+
+
+class OddsApiClient:
+    def __init__(self, api_key: str, timeout: int = 30):
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def _request(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        url = f"{ODDS_BASE}/{endpoint}"
+        params = params or {}
+        params.update({"apiKey": self.api_key})
+        logging.debug("Requesting Odds API endpoint %s", url)
+        resp = requests.get(url, params=params, timeout=self.timeout)
+        resp.raise_for_status()
+        remaining = resp.headers.get("x-requests-remaining")
+        if remaining is not None:
+            logging.debug("Odds API requests remaining: %s", remaining)
+        return resp.json()
+
+    def fetch_odds(self) -> List[Dict[str, Any]]:
+        params = {
+            "regions": ",".join(ODDS_REGIONS),
+            "oddsFormat": ODDS_FORMAT,
+            "markets": "h2h",
+        }
+        return self._request(f"sports/{NFL_SPORT_KEY}/odds", params=params)
+
+
+# ---------------------------------------------------------------------------
+# Ingestion pipeline
+# ---------------------------------------------------------------------------
+
+
+class NFLIngestor:
+    def __init__(
+        self,
+        db: NFLDatabase,
+        msf_client: MySportsFeedsClient,
+        odds_client: OddsApiClient,
+        supplemental_loader: SupplementalDataLoader,
+    ):
+        self.db = db
+        self.msf_client = msf_client
+        self.odds_client = odds_client
+        self.supplemental_loader = supplemental_loader
+
+    def ingest(self, seasons: Iterable[str]) -> None:
+        existing_games = self.db.fetch_existing_game_ids()
+        games_with_stats = self.db.fetch_games_with_player_stats()
+        logging.info("Found %d games already in database", len(existing_games))
+
+        injury_rows_all: List[Dict[str, Any]] = []
+        depth_rows_map: Dict[str, Dict[str, Any]] = {}
+        advanced_rows_map: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
+
+        for season in seasons:
+            games = self.msf_client.fetch_games(season)
+            logging.info("Fetched %d games for season %s", len(games), season)
+            if not games:
+                logging.warning(
+                    "No games returned from MySportsFeeds for %s. "
+                    "Verify your API credentials, plan access, and season configuration.",
+                    season,
+                )
+
+            new_game_rows: List[Dict[str, Any]] = []
+            player_rows: List[Dict[str, Any]] = []
+
+            for game in games:
+                schedule = game.get("schedule", {})
+                game_id = schedule.get("id")
+                if not game_id:
+                    continue
+
+                game_id_str = str(game_id)
+                have_player_stats = game_id_str in games_with_stats
+
+                score = game.get("score") or {}
+                home_score, away_score = self._extract_score_totals(score)
+                start_time = parse_dt(schedule.get("startTime"))
+                venue = schedule.get("venue") or {}
+                weather = schedule.get("weather") or {}
+                officials = schedule.get("officials") or []
+                home_team_abbr = normalize_team_abbr(
+                    (schedule.get("homeTeam") or {}).get("abbreviation")
+                    or (schedule.get("homeTeam") or {}).get("name")
+                )
+                away_team_abbr = normalize_team_abbr(
+                    (schedule.get("awayTeam") or {}).get("abbreviation")
+                    or (schedule.get("awayTeam") or {}).get("name")
+                )
+
+                injuries, injury_summary = self.supplemental_loader.injuries_for_game(
+                    game_id_str, home_team_abbr, away_team_abbr
+                )
+                if injuries:
+                    injury_rows_all.extend(injuries)
+
+                for team_code in filter(None, {home_team_abbr, away_team_abbr}):
+                    for depth_row in self.supplemental_loader.depth_chart_rows(team_code):
+                        depth_rows_map[depth_row["depth_id"]] = depth_row
+
+                week_value = schedule.get("week")
+                try:
+                    week_int = int(week_value) if week_value is not None else None
+                except (TypeError, ValueError):
+                    week_int = None
+
+                for team_code in filter(None, {home_team_abbr, away_team_abbr}):
+                    advanced_payload = self.supplemental_loader.advanced_metrics(
+                        season, week_int, team_code
+                    )
+                    if not advanced_payload:
+                        continue
+                    metric_id = advanced_payload.get("metric_id") or uuid.uuid4().hex
+                    advanced_rows_map[(str(season), week_int or 0, team_code)] = {
+                        "metric_id": metric_id,
+                        "season": str(season),
+                        "week": week_int,
+                        "team": team_code,
+                        "pace_seconds_per_play": self._safe_float(
+                            advanced_payload.get("pace_seconds_per_play")
+                            or advanced_payload.get("pace")
+                        ),
+                        "offense_epa": self._safe_float(advanced_payload.get("offense_epa")),
+                        "defense_epa": self._safe_float(advanced_payload.get("defense_epa")),
+                        "offense_success_rate": self._safe_float(
+                            advanced_payload.get("offense_success_rate")
+                        ),
+                        "defense_success_rate": self._safe_float(
+                            advanced_payload.get("defense_success_rate")
+                        ),
+                        "travel_penalty": self._safe_float(advanced_payload.get("travel_penalty")),
+                        "rest_penalty": self._safe_float(advanced_payload.get("rest_penalty")),
+                        "weather_adjustment": self._safe_float(
+                            advanced_payload.get("weather_adjustment")
+                        ),
+                    }
+
+                referee_name: Optional[str] = None
+                if officials:
+                    lead_official = officials[0] or {}
+                    first = lead_official.get("firstName", "")
+                    last = lead_official.get("lastName", "")
+                    referee_name = f"{first} {last}".strip()
+                    if not referee_name:
+                        referee_name = lead_official.get("fullName")
+
+                wind_mph = self._extract_wind_mph(weather.get("windSpeed"))
+                humidity = self._extract_humidity(weather.get("humidity"))
+                weather_override = self.supplemental_loader.weather_override(game_id_str)
+                if weather_override:
+                    if weather_override.get("temperature_f") is not None:
+                        weather["temperature"] = weather_override.get("temperature_f")
+                    if weather_override.get("conditions"):
+                        weather["conditions"] = weather_override.get("conditions")
+                    wind_mph = self._safe_float(weather_override.get("wind_mph") or wind_mph)
+                    humidity = self._safe_float(weather_override.get("humidity") or humidity)
+                    if weather_override.get("temperature_f") is not None:
+                        weather_temperature = weather_override.get("temperature_f")
+                    else:
+                        weather_temperature = weather.get("temperature")
+                else:
+                    weather_temperature = weather.get("temperature")
+
+                temperature_f = self._extract_temperature_fahrenheit(weather_temperature)
+                wind_mph = self._safe_float(wind_mph)
+                humidity = self._safe_float(humidity)
+
+                new_game_rows.append(
+                    {
+                        "game_id": game_id_str,
+                        "season": season,
+                        "week": schedule.get("week"),
+                        "start_time": start_time,
+                        "venue": venue.get("name"),
+                        "city": venue.get("city"),
+                        "state": venue.get("state"),
+                        "country": venue.get("country"),
+                        "surface": venue.get("surface"),
+                        "day_of_week": start_time.strftime("%A") if start_time else None,
+                        "referee": referee_name,
+                        "temperature_f": temperature_f,
+                        "weather_conditions": weather.get("conditions"),
+                        "wind_mph": wind_mph,
+                        "humidity": humidity,
+                        "injury_summary": injury_summary,
+                        "home_team": home_team_abbr,
+                        "away_team": away_team_abbr,
+                        "home_score": home_score,
+                        "away_score": away_score,
+                        "status": schedule.get("status"),
+                    }
+                )
+
+                status = (
+                    schedule.get("status")
+                    or schedule.get("playedStatus")
+                    or (game.get("status") if isinstance(game, dict) else None)
+                    or ""
+                ).lower()
+                is_completed = status.startswith("final") or status in {"completed", "postponed"}
+
+                if have_player_stats:
+                    logging.debug(
+                        "Skipping player stats for already ingested game %s", game_id_str
+                    )
+                    continue
+
+                if not is_completed:
+                    logging.debug(
+                        "Game %s in season %s has status '%s'; skipping player stats fetch until completion",
+                        game_id_str,
+                        season,
+                        schedule.get("status"),
+                    )
+                    continue
+
+                gamelog_entries = self.msf_client.fetch_player_gamelogs(season, game_id_str)
+                player_entries = list(gamelog_entries)
+                if not player_entries:
+                    logging.debug(
+                        "No player gamelog entries returned for season %s game %s", season, game_id_str
+                    )
+                    fallback_entries = self._fetch_boxscore_player_stats(season, game_id_str)
+                    if fallback_entries:
+                        logging.debug(
+                            "Using boxscore fallback for season %s game %s player stats",
+                            season,
+                            game_id_str,
+                        )
+                        player_entries = fallback_entries
+                if not player_entries:
+                    continue
+                for entry in player_entries:
+                    player = entry.get("player", {})
+                    team = entry.get("team", {})
+                    stats = entry.get("stats", {})
+
+                    def stat_value(stat_group: str, field: str) -> Optional[float]:
+                        group = stats.get(stat_group, {})
+                        value = group.get(field, {})
+                        return value.get("#text") or value.get("value")
+
+                    player_rows.append(
+                        {
+                            "game_id": game_id_str,
+                            "player_id": str(player.get("id")),
+                            "player_name": f"{player.get('firstName', '')} {player.get('lastName', '')}".strip(),
+                            "team": team.get("abbreviation"),
+                            "position": player.get("position"),
+                            "rushing_attempts": self._safe_float(stat_value("Rushing", "RushingAttempts")),
+                            "rushing_yards": self._safe_float(stat_value("Rushing", "RushingYards")),
+                            "rushing_tds": self._safe_float(stat_value("Rushing", "RushingTD")),
+                            "receiving_targets": self._safe_float(stat_value("Receiving", "Targets")),
+                            "receptions": self._safe_float(stat_value("Receiving", "Receptions")),
+                            "receiving_yards": self._safe_float(stat_value("Receiving", "ReceivingYards")),
+                            "receiving_tds": self._safe_float(stat_value("Receiving", "ReceivingTD")),
+                            "passing_attempts": self._safe_float(stat_value("Passing", "PassAttempts")),
+                            "passing_completions": self._safe_float(stat_value("Passing", "PassCompletions")),
+                            "passing_yards": self._safe_float(stat_value("Passing", "PassYards")),
+                            "passing_tds": self._safe_float(stat_value("Passing", "PassTD")),
+                            "fantasy_points": self._safe_float(stat_value("Fantasy", "FantasyPoints")),
+                            "snap_count": self._safe_float(stat_value("Miscellaneous", "Snaps")),
+                        }
+                    )
+
+            self.db.upsert_rows(self.db.games, new_game_rows, ["game_id"])
+            self.db.upsert_rows(self.db.player_stats, player_rows, ["game_id", "player_id"])
+            if len(new_game_rows) == 0 and len(player_rows) == 0:
+                logging.warning(
+                    "Ingested %d new games and %d player stat rows for %s. "
+                    "If these counts are unexpectedly low, confirm that your MySportsFeeds subscription "
+                    "includes detailed stats and that the targeted seasons contain completed games.",
+                    len(new_game_rows),
+                    len(player_rows),
+                    season,
+                )
+
+        if injury_rows_all:
+            self.db.upsert_rows(self.db.injury_reports, injury_rows_all, ["injury_id"])
+        if depth_rows_map:
+            self.db.upsert_rows(
+                self.db.depth_charts,
+                list(depth_rows_map.values()),
+                ["depth_id"],
+            )
+        if advanced_rows_map:
+            self.db.upsert_rows(
+                self.db.team_advanced_metrics,
+                list(advanced_rows_map.values()),
+                ["metric_id"],
+            )
+
+        # Ingest odds separately as they change frequently (always upsert)
+        self._ingest_odds()
+
+    def _ingest_odds(self) -> None:
+        odds_data = self.odds_client.fetch_odds()
+        logging.info("Fetched %d odds entries", len(odds_data))
+
+        odds_rows: List[Dict[str, Any]] = []
+        for event in odds_data:
+            commence_time = parse_dt(event.get("commence_time"))
+
+            teams_list = [team for team in (event.get("teams") or []) if team]
+
+            home_team_raw = event.get("home_team") or (teams_list[0] if teams_list else None)
+            away_team_raw = event.get("away_team")
+            if not away_team_raw and teams_list:
+                away_team_raw = next(
+                    (team for team in teams_list if team != home_team_raw),
+                    teams_list[0] if teams_list else None,
+                )
+
+            home_team = normalize_team_abbr(home_team_raw)
+            away_team = normalize_team_abbr(away_team_raw)
+
+            if not home_team or not away_team:
+                logging.debug(
+                    "Skipping odds event %s due to unmapped team names (home=%s, away=%s)",
+                    event.get("id"),
+                    home_team_raw,
+                    away_team_raw,
+                )
+                continue
+
+            markets = event.get("bookmakers", [])
+            if not markets:
+                continue
+            # Use the freshest bookmaker odds
+            market = sorted(markets, key=lambda b: parse_dt(b.get("last_update")) or default_now_utc(), reverse=True)[0]
+            last_update = parse_dt(market.get("last_update"))
+            h2h = next((m for m in market.get("markets", []) if m.get("key") == "h2h"), None)
+            if not h2h:
+                continue
+
+            prices = {outcome.get("name"): outcome.get("price") for outcome in h2h.get("outcomes", [])}
+            home_price = prices.get(home_team)
+            away_price = prices.get(away_team)
+
+            def american_to_prob(odds: Optional[float]) -> Optional[float]:
+                if odds is None:
+                    return None
+                odds = float(odds)
+                if odds > 0:
+                    return 100.0 / (odds + 100.0)
+                return -odds / (-odds + 100.0)
+
+            odds_rows.append(
+                {
+                    "game_id": event.get("id"),
+                    "season": self._infer_season(commence_time),
+                    "week": None,
+                    "start_time": commence_time,
+                    "venue": None,
+                    "city": None,
+                    "state": None,
+                    "country": None,
+                    "surface": None,
+                    "day_of_week": commence_time.strftime("%A") if commence_time else None,
+                    "referee": None,
+                    "temperature_f": None,
+                    "weather_conditions": None,
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "home_score": None,
+                    "away_score": None,
+                    "status": "upcoming",
+                    "home_moneyline": home_price,
+                    "away_moneyline": away_price,
+                    "home_implied_prob": american_to_prob(home_price),
+                    "away_implied_prob": american_to_prob(away_price),
+                    "odds_updated": last_update,
+                }
+            )
+
+        self.db.upsert_rows(
+            self.db.games,
+            odds_rows,
+            ["game_id"],
+            update_columns=[
+                "start_time",
+            "home_moneyline",
+            "away_moneyline",
+            "home_implied_prob",
+            "away_implied_prob",
+            "odds_updated",
+            "home_team",
+            "away_team",
+        ],
+    )
+
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _extract_temperature_fahrenheit(value: Any) -> Optional[float]:
+        """Normalize temperature payloads into a Fahrenheit float."""
+
+        if value is None:
+            return None
+
+        if isinstance(value, dict):
+            candidates = [
+                value.get("fahrenheit"),
+                value.get("F"),
+                value.get("tempF"),
+                value.get("value"),
+            ]
+            for candidate in candidates:
+                result = NFLIngestor._safe_float(candidate)
+                if result is not None:
+                    return result
+            return None
+
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                result = NFLIngestor._extract_temperature_fahrenheit(item)
+                if result is not None:
+                    return result
+            return None
+
+        return NFLIngestor._safe_float(value)
+
+    @staticmethod
+    def _infer_season(start_time: Optional[dt.datetime]) -> Optional[str]:
+        if not start_time:
+            return None
+        year = start_time.year
+        if start_time.month < 3:
+            year -= 1
+        return f"{year}-regular"
+
+    @staticmethod
+    def _extract_wind_mph(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            for key in ("milesPerHour", "mph", "value", "speed", "#text"):
+                if key in value:
+                    result = NFLIngestor._safe_float(value[key])
+                    if result is not None:
+                        return result
+        return NFLIngestor._safe_float(value)
+
+    @staticmethod
+    def _extract_humidity(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            for key in ("percent", "humidity", "value", "#text"):
+                if key in value:
+                    result = NFLIngestor._safe_float(value[key])
+                    if result is not None:
+                        return result
+        return NFLIngestor._safe_float(value)
+
+    def _fetch_boxscore_player_stats(self, season: str, game_id: str) -> List[Dict[str, Any]]:
+        """Fallback to boxscore endpoint when detailed gamelogs are unavailable."""
+
+        try:
+            boxscore = self.msf_client.fetch_game_boxscore(season, game_id)
+        except HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 404:
+                logging.debug(
+                    "Boxscore not available for season %s game %s (HTTP 404)",
+                    season,
+                    game_id,
+                )
+                return []
+            logging.debug(
+                "Failed to fetch boxscore for season %s game %s: %s",
+                season,
+                game_id,
+                exc,
+            )
+            return []
+
+        game_info = boxscore.get("game", {}) or {}
+        team_lookup = {
+            "home": (game_info.get("homeTeam") or {}).get("abbreviation"),
+            "away": (game_info.get("awayTeam") or {}).get("abbreviation"),
+        }
+
+        stats_root = boxscore.get("stats") or {}
+        normalized: List[Dict[str, Any]] = []
+        for side in ("home", "away"):
+            side_payload = stats_root.get(side) or {}
+            players = side_payload.get("players") or []
+            team_abbr = team_lookup.get(side)
+            for player_entry in players:
+                if not isinstance(player_entry, dict):
+                    continue
+                player_stats = self._normalize_boxscore_stat_groups(player_entry.get("playerStats"))
+                normalized.append(
+                    {
+                        "player": player_entry.get("player", {}) or {},
+                        "team": {"abbreviation": team_abbr} if team_abbr else {},
+                        "stats": player_stats,
+                    }
+                )
+
+        return normalized
+
+    @staticmethod
+    def _normalize_boxscore_stat_groups(raw_groups: Any) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """Convert boxscore player stat groups to the gamelog-style schema."""
+
+        if not isinstance(raw_groups, list):
+            return {}
+
+        normalized: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+        def assign(group: str, target: str, value: Any) -> None:
+            if value in (None, ""):
+                return
+            normalized.setdefault(group, {})[target] = {"value": value}
+
+        for group_entry in raw_groups:
+            if not isinstance(group_entry, dict):
+                continue
+            for group_name, metrics in group_entry.items():
+                if not isinstance(metrics, dict):
+                    continue
+                key = group_name.lower()
+                if key == "rushing":
+                    assign("Rushing", "RushingAttempts", metrics.get("rushAttempts"))
+                    assign("Rushing", "RushingYards", metrics.get("rushYards"))
+                    assign("Rushing", "RushingTD", metrics.get("rushTD"))
+                elif key == "receiving":
+                    assign("Receiving", "Targets", metrics.get("targets"))
+                    assign("Receiving", "Receptions", metrics.get("receptions"))
+                    assign("Receiving", "ReceivingYards", metrics.get("recYards"))
+                    assign("Receiving", "ReceivingTD", metrics.get("recTD"))
+                elif key == "passing":
+                    assign("Passing", "PassAttempts", metrics.get("passAttempts"))
+                    assign("Passing", "PassCompletions", metrics.get("passCompletions"))
+                    assign("Passing", "PassYards", metrics.get("passYards"))
+                    assign("Passing", "PassTD", metrics.get("passTD"))
+                elif key == "fumbles":
+                    assign("Fumbles", "Fumbles", metrics.get("fumbles"))
+                elif key == "snapcounts":
+                    offense_snaps = metrics.get("offenseSnaps")
+                    if offense_snaps is not None:
+                        assign("Miscellaneous", "Snaps", offense_snaps)
+
+        return normalized
+
+    @staticmethod
+    def _extract_score_totals(score_payload: Any) -> Tuple[Optional[float], Optional[float]]:
+        """Extract final home and away scores from the flexible MSF schedule payload."""
+
+        if not isinstance(score_payload, dict):
+            return None, None
+
+        def first_numeric(mapping: Dict[str, Any], candidates: Tuple[str, ...]) -> Optional[float]:
+            for key in candidates:
+                if key not in mapping or mapping[key] in (None, ""):
+                    continue
+                value = mapping[key]
+                if isinstance(value, dict):
+                    for inner_key in ("#text", "value", "total", "score", "amount"):
+                        inner_val = value.get(inner_key)
+                        parsed = NFLIngestor._safe_float(inner_val)
+                        if parsed is not None:
+                            return parsed
+                    parsed = NFLIngestor._safe_float(value)
+                    if parsed is not None:
+                        return parsed
+                else:
+                    parsed = NFLIngestor._safe_float(value)
+                    if parsed is not None:
+                        return parsed
+            return None
+
+        home_candidates = (
+            "homeScore",
+            "homeScoreTotal",
+            "homeScoreFinal",
+            "homePoints",
+            "homeScoreValue",
+        )
+        away_candidates = (
+            "awayScore",
+            "awayScoreTotal",
+            "awayScoreFinal",
+            "awayPoints",
+            "awayScoreValue",
+        )
+
+        return first_numeric(score_payload, home_candidates), first_numeric(score_payload, away_candidates)
+
+
+# ---------------------------------------------------------------------------
+# Feature engineering & modeling
+# ---------------------------------------------------------------------------
+
+
+class FeatureBuilder:
+    """Transforms raw database tables into model-ready feature sets."""
+
+    def __init__(self, engine: Engine):
+        self.engine = engine
+        self.games_frame: Optional[pd.DataFrame] = None
+        self.player_feature_frame: Optional[pd.DataFrame] = None
+        self.team_strength_frame: Optional[pd.DataFrame] = None
+        self.team_strength_latest_by_season: Optional[pd.DataFrame] = None
+        self.team_strength_latest_overall: Optional[pd.DataFrame] = None
+        self.team_history_frame: Optional[pd.DataFrame] = None
+        self.team_history_latest_by_season: Optional[pd.DataFrame] = None
+        self.team_history_latest_overall: Optional[pd.DataFrame] = None
+        self.context_feature_frame: Optional[pd.DataFrame] = None
+        self.injury_frame: Optional[pd.DataFrame] = None
+        self.depth_chart_frame: Optional[pd.DataFrame] = None
+        self.advanced_metrics_frame: Optional[pd.DataFrame] = None
+
+    def load_dataframes(
+        self,
+    ) -> Tuple[
+        pd.DataFrame,
+        pd.DataFrame,
+        pd.DataFrame,
+        pd.DataFrame,
+        pd.DataFrame,
+        pd.DataFrame,
+    ]:
+        games = pd.read_sql_table("nfl_games", self.engine)
+        player_stats = pd.read_sql_table("nfl_player_stats", self.engine)
+        team_ratings = pd.read_sql_table("nfl_team_unit_ratings", self.engine)
+        injuries = pd.read_sql_table("nfl_injury_reports", self.engine)
+        depth_charts = pd.read_sql_table("nfl_depth_charts", self.engine)
+        advanced_metrics = pd.read_sql_table("nfl_team_advanced_metrics", self.engine)
+
+        # Normalize column names to plain strings so downstream pipelines see
+        # consistent labels regardless of database dialect.
+        games = games.rename(columns=lambda col: str(col))
+        player_stats = player_stats.rename(columns=lambda col: str(col))
+        team_ratings = team_ratings.rename(columns=lambda col: str(col))
+        injuries = injuries.rename(columns=lambda col: str(col))
+        depth_charts = depth_charts.rename(columns=lambda col: str(col))
+        advanced_metrics = advanced_metrics.rename(columns=lambda col: str(col))
+        return games, player_stats, team_ratings, injuries, depth_charts, advanced_metrics
+
+    def build_features(self) -> Dict[str, pd.DataFrame]:
+        (
+            games,
+            player_stats,
+            team_ratings,
+            injuries,
+            depth_charts,
+            advanced_metrics,
+        ) = self.load_dataframes()
+
+        if games.empty:
+            logging.warning("No games available in the database. Skipping model training.")
+            return {}
+
+        games = games.copy()
+        player_stats = player_stats.copy()
+        injuries = injuries.copy()
+        depth_charts = depth_charts.copy()
+        advanced_metrics = advanced_metrics.copy()
+        self.games_frame = games
+        self.injury_frame = injuries
+        self.depth_chart_frame = depth_charts
+        self.advanced_metrics_frame = advanced_metrics
+
+        # Basic cleanup
+        games["start_time"] = pd.to_datetime(games["start_time"])
+        games["day_of_week"] = games["day_of_week"].fillna(
+            games["start_time"].dt.day_name()
+        )
+        games["game_result"] = np.where(
+            games["home_score"] > games["away_score"], "home",
+            np.where(games["home_score"] < games["away_score"], "away", "push"),
+        )
+
+        if not injuries.empty:
+            injuries["team"] = injuries["team"].apply(normalize_team_abbr)
+            status_map = {
+                "out": "out",
+                "doubtful": "doubtful",
+                "questionable": "questionable",
+                "probable": "probable",
+                "suspended": "suspended",
+                "injured reserve": "out",
+                "physically unable to perform": "out",
+                "reserve/covid-19": "out",
+            }
+            injuries["status_bucket"] = (
+                injuries["status"].fillna("").str.lower().str.strip().map(status_map).fillna("other")
+            )
+            injury_counts = (
+                injuries.groupby(["game_id", "team", "status_bucket"]).size().unstack(fill_value=0).reset_index()
+            )
+            value_columns = [col for col in injury_counts.columns if col not in {"game_id", "team"}]
+            injury_counts["injury_total"] = injury_counts[value_columns].sum(axis=1)
+
+            home_injuries = injury_counts.rename(columns={"team": "home_team"})
+            home_injuries = home_injuries.rename(
+                columns={col: f"home_injury_{col}" for col in home_injuries.columns if col not in {"game_id", "home_team"}}
+            )
+            games = games.merge(home_injuries, on=["game_id", "home_team"], how="left")
+
+            away_injuries = injury_counts.rename(columns={"team": "away_team"})
+            away_injuries = away_injuries.rename(
+                columns={col: f"away_injury_{col}" for col in away_injuries.columns if col not in {"game_id", "away_team"}}
+            )
+            games = games.merge(away_injuries, on=["game_id", "away_team"], how="left")
+
+            injury_feature_columns = [col for col in games.columns if col.endswith("_injury_total") or "_injury_" in col]
+            for col in injury_feature_columns:
+                games[col] = games[col].fillna(0.0)
+
+        # Derive rolling scoring, rest, and win-rate indicators from historical games.
+        team_game_history = self._compute_team_game_rolling_stats(games)
+        self.team_history_frame = team_game_history
+        penalties_by_week = pd.DataFrame()
+        if not team_game_history.empty:
+            penalties_by_week = (
+                team_game_history.groupby(["season", "week", "team"], as_index=False)[
+                    ["travel_penalty", "rest_penalty", "timezone_diff_hours"]
+                ]
+                .mean()
+                .rename(columns={"timezone_diff_hours": "avg_timezone_diff_hours"})
+            )
+        if not team_game_history.empty:
+            history_sorted = team_game_history.sort_values(["team", "season", "start_time"])
+            self.team_history_latest_by_season = history_sorted.drop_duplicates(
+                subset=["team", "season"], keep="last"
+            )
+            self.team_history_latest_overall = history_sorted.drop_duplicates(
+                subset=["team"], keep="last"
+            )
+        else:
+            empty_history = team_game_history.iloc[0:0]
+            self.team_history_latest_by_season = empty_history
+            self.team_history_latest_overall = empty_history
+
+        datasets: Dict[str, pd.DataFrame] = {}
+        team_strength: pd.DataFrame
+
+        def _merge_penalties_into_strength(strength: pd.DataFrame) -> pd.DataFrame:
+            if strength is None or strength.empty or penalties_by_week.empty:
+                return strength
+            merged_strength = strength.merge(
+                penalties_by_week,
+                on=["season", "week", "team"],
+                how="left",
+                suffixes=("", "_hist"),
+            )
+            for col in ["travel_penalty", "rest_penalty", "avg_timezone_diff_hours"]:
+                hist_col = f"{col}_hist"
+                if hist_col in merged_strength:
+                    merged_strength[col] = merged_strength[col].combine_first(
+                        merged_strength[hist_col]
+                    )
+                    merged_strength.drop(columns=[hist_col], inplace=True)
+            return merged_strength
+
+        if player_stats.empty:
+            logging.warning(
+                "Player statistics table is empty. Player-level models will not be trained."
+            )
+            team_strength = self._compute_team_unit_strength(player_stats, advanced_metrics)
+            team_strength = _merge_penalties_into_strength(team_strength)
+            self.team_strength_frame = team_strength
+        else:
+            enrichment_columns = [
+                "game_id",
+                "season",
+                "week",
+                "start_time",
+                "venue",
+                "city",
+                "state",
+                "day_of_week",
+                "referee",
+                "weather_conditions",
+                "temperature_f",
+                "home_team",
+                "away_team",
+            ]
+            player_stats = player_stats.merge(
+                games[enrichment_columns],
+                on="game_id",
+                how="left",
+            )
+
+            team_strength = self._compute_team_unit_strength(player_stats, advanced_metrics)
+            team_strength = _merge_penalties_into_strength(team_strength)
+
+            player_stats = player_stats.merge(
+                team_strength,
+                on=["team", "season", "week"],
+                how="left",
+                suffixes=("", "_team"),
+            )
+
+            opponent_strength = team_strength.rename(
+                columns={
+                    "team": "opponent",
+                    "offense_pass_rating": "opp_offense_pass_rating",
+                    "offense_rush_rating": "opp_offense_rush_rating",
+                    "defense_pass_rating": "opp_defense_pass_rating",
+                    "defense_rush_rating": "opp_defense_rush_rating",
+                    "pace_seconds_per_play": "opp_pace_seconds_per_play",
+                    "offense_epa": "opp_offense_epa",
+                    "defense_epa": "opp_defense_epa",
+                    "offense_success_rate": "opp_offense_success_rate",
+                    "defense_success_rate": "opp_defense_success_rate",
+                    "travel_penalty": "opp_travel_penalty",
+                    "rest_penalty": "opp_rest_penalty",
+                    "weather_adjustment": "opp_weather_adjustment",
+                    "avg_timezone_diff_hours": "opp_timezone_diff_hours",
+                }
+            )
+
+            player_stats = player_stats.merge(
+                games[["game_id", "home_team", "away_team"]],
+                on="game_id",
+                how="left",
+                suffixes=("", "_game"),
+            )
+
+            player_stats["opponent"] = np.where(
+                player_stats["team"] == player_stats["home_team"],
+                player_stats["away_team"],
+                player_stats["home_team"],
+            )
+
+            player_stats = player_stats.merge(
+                opponent_strength,
+                on=["opponent", "season", "week"],
+                how="left",
+            )
+
+            context_features = self._compute_contextual_averages(player_stats)
+            self.context_feature_frame = context_features
+            player_stats = player_stats.merge(
+                context_features,
+                on=["team", "venue", "day_of_week", "referee"],
+                how="left",
+            )
+
+            def add_dataset(target: str, positions: Iterable[str]) -> None:
+                subset = player_stats[player_stats["position"].isin(list(positions))].copy()
+                subset = subset[subset[target].notna()]
+                if subset.empty:
+                    logging.debug(
+                        "Skipping %s dataset because no rows remained after filtering", target
+                    )
+                    return
+                datasets[target] = subset
+
+            add_dataset("rushing_yards", ["RB", "HB", "FB", "QB"])
+            add_dataset("receiving_yards", ["WR", "RB", "HB", "FB", "TE"])
+            add_dataset("receptions", ["WR", "RB", "HB", "FB", "TE"])
+            add_dataset("rushing_tds", ["RB", "HB", "FB", "QB"])
+            add_dataset("receiving_tds", ["WR", "RB", "TE"])
+            add_dataset("passing_tds", ["QB"])
+
+        if self.team_strength_frame is None:
+            self.team_strength_frame = team_strength
+        if self.team_strength_frame is not None and not self.team_strength_frame.empty:
+            sorted_strength = self.team_strength_frame.sort_values(["team", "season", "week"])
+            self.team_strength_latest_by_season = sorted_strength.drop_duplicates(
+                subset=["team", "season"], keep="last"
+            )
+            self.team_strength_latest_overall = sorted_strength.drop_duplicates(
+                subset=["team"], keep="last"
+            )
+        else:
+            empty_strength = team_strength.iloc[0:0]
+            self.team_strength_latest_by_season = empty_strength
+            self.team_strength_latest_overall = empty_strength
+
+        if self.context_feature_frame is None:
+            self.context_feature_frame = pd.DataFrame(
+                columns=[
+                    "team",
+                    "venue",
+                    "day_of_week",
+                    "referee",
+                    "avg_rush_yards",
+                    "avg_rec_yards",
+                    "avg_receptions",
+                    "avg_rush_tds",
+                    "avg_rec_tds",
+                ]
+            )
+
+        if player_stats.empty:
+            self.player_feature_frame = pd.DataFrame(columns=player_stats.columns)
+        else:
+            self.player_feature_frame = player_stats
+
+        home_strength = team_strength.rename(
+            columns={
+                "team": "home_team",
+                "offense_pass_rating": "home_offense_pass_rating",
+                "offense_rush_rating": "home_offense_rush_rating",
+                "defense_pass_rating": "home_defense_pass_rating",
+                "defense_rush_rating": "home_defense_rush_rating",
+                "pace_seconds_per_play": "home_pace_seconds_per_play",
+                "offense_epa": "home_offense_epa",
+                "defense_epa": "home_defense_epa",
+                "offense_success_rate": "home_offense_success_rate",
+                "defense_success_rate": "home_defense_success_rate",
+                "travel_penalty": "home_travel_penalty",
+                "rest_penalty": "home_rest_penalty",
+                "weather_adjustment": "home_weather_adjustment",
+                "avg_timezone_diff_hours": "home_timezone_diff_hours",
+            }
+        )
+        away_strength = team_strength.rename(
+            columns={
+                "team": "away_team",
+                "offense_pass_rating": "away_offense_pass_rating",
+                "offense_rush_rating": "away_offense_rush_rating",
+                "defense_pass_rating": "away_defense_pass_rating",
+                "defense_rush_rating": "away_defense_rush_rating",
+                "pace_seconds_per_play": "away_pace_seconds_per_play",
+                "offense_epa": "away_offense_epa",
+                "defense_epa": "away_defense_epa",
+                "offense_success_rate": "away_offense_success_rate",
+                "defense_success_rate": "away_defense_success_rate",
+                "travel_penalty": "away_travel_penalty",
+                "rest_penalty": "away_rest_penalty",
+                "weather_adjustment": "away_weather_adjustment",
+                "avg_timezone_diff_hours": "away_timezone_diff_hours",
+            }
+        )
+
+        home_history = team_game_history[team_game_history["is_home"]].drop(
+            columns=["team", "is_home"]
+        )
+        home_history = home_history.rename(
+            columns={
+                "game_id": "game_id",
+                "rolling_points_for": "home_points_for_avg",
+                "rolling_points_against": "home_points_against_avg",
+                "rolling_point_diff": "home_point_diff_avg",
+                "rolling_win_pct": "home_win_pct_recent",
+                "prev_points_for": "home_prev_points_for",
+                "prev_points_against": "home_prev_points_against",
+                "prev_point_diff": "home_prev_point_diff",
+                "rest_days": "home_rest_days",
+                "rest_penalty": "home_rest_penalty",
+                "travel_penalty": "home_travel_penalty_hist",
+                "timezone_diff_hours": "home_timezone_diff_hours",
+            }
+        )
+
+        away_history = team_game_history[~team_game_history["is_home"]].drop(
+            columns=["team", "is_home"]
+        )
+        away_history = away_history.rename(
+            columns={
+                "game_id": "game_id",
+                "rolling_points_for": "away_points_for_avg",
+                "rolling_points_against": "away_points_against_avg",
+                "rolling_point_diff": "away_point_diff_avg",
+                "rolling_win_pct": "away_win_pct_recent",
+                "prev_points_for": "away_prev_points_for",
+                "prev_points_against": "away_prev_points_against",
+                "prev_point_diff": "away_prev_point_diff",
+                "rest_days": "away_rest_days",
+                "rest_penalty": "away_rest_penalty",
+                "travel_penalty": "away_travel_penalty_hist",
+                "timezone_diff_hours": "away_timezone_diff_hours",
+            }
+        )
+
+        games_context = (
+            games.merge(
+                home_strength,
+                on=["home_team", "season", "week"],
+                how="left",
+            )
+            .merge(
+                away_strength,
+                on=["away_team", "season", "week"],
+                how="left",
+            )
+            .merge(home_history, on="game_id", how="left")
+            .merge(away_history, on="game_id", how="left")
+        )
+
+        if "home_travel_penalty_hist" in games_context.columns:
+            games_context["home_travel_penalty"] = games_context["home_travel_penalty"].combine_first(
+                games_context["home_travel_penalty_hist"]
+            )
+            games_context.drop(columns=["home_travel_penalty_hist"], inplace=True)
+        if "away_travel_penalty_hist" in games_context.columns:
+            games_context["away_travel_penalty"] = games_context["away_travel_penalty"].combine_first(
+                games_context["away_travel_penalty_hist"]
+            )
+            games_context.drop(columns=["away_travel_penalty_hist"], inplace=True)
+
+        games_context["moneyline_diff"] = games_context["home_moneyline"] - games_context["away_moneyline"]
+        games_context["implied_prob_diff"] = (
+            games_context["home_implied_prob"] - games_context["away_implied_prob"]
+        )
+        games_context["implied_prob_sum"] = (
+            games_context["home_implied_prob"] + games_context["away_implied_prob"]
+        )
+
+        games_context["point_diff"] = games_context["home_score"] - games_context["away_score"]
+        games_labeled = games_context.dropna(subset=["home_score", "away_score"])
+        if games_labeled.empty:
+            logging.warning(
+                "No completed games with scores available. Game outcome model will be skipped."
+            )
+        else:
+            datasets["game_outcome"] = games_labeled
+
+        return datasets
+
+    # ------------------------------------------------------------------
+    # Upcoming feature preparation
+    # ------------------------------------------------------------------
+
+    def _get_latest_team_strength(self, team: str, season: Optional[str]) -> Optional[pd.Series]:
+        if self.team_strength_latest_by_season is not None and not self.team_strength_latest_by_season.empty:
+            if season:
+                match = self.team_strength_latest_by_season[
+                    (self.team_strength_latest_by_season["team"] == team)
+                    & (self.team_strength_latest_by_season["season"] == season)
+                ]
+                if not match.empty:
+                    return match.iloc[0]
+        if self.team_strength_latest_overall is not None and not self.team_strength_latest_overall.empty:
+            match = self.team_strength_latest_overall[
+                self.team_strength_latest_overall["team"] == team
+            ]
+            if not match.empty:
+                return match.iloc[0]
+        return None
+
+    def _get_latest_team_history(self, team: str, season: Optional[str]) -> Optional[pd.Series]:
+        if self.team_history_latest_by_season is not None and not self.team_history_latest_by_season.empty:
+            if season:
+                match = self.team_history_latest_by_season[
+                    (self.team_history_latest_by_season["team"] == team)
+                    & (self.team_history_latest_by_season["season"] == season)
+                ]
+                if not match.empty:
+                    return match.iloc[0]
+        if self.team_history_latest_overall is not None and not self.team_history_latest_overall.empty:
+            match = self.team_history_latest_overall[
+                self.team_history_latest_overall["team"] == team
+            ]
+            if not match.empty:
+                return match.iloc[0]
+        return None
+
+    def prepare_upcoming_game_features(self, upcoming_games: pd.DataFrame) -> pd.DataFrame:
+        if upcoming_games.empty:
+            return upcoming_games.copy()
+
+        features = upcoming_games.copy()
+        features["start_time"] = pd.to_datetime(features["start_time"])
+        if "day_of_week" not in features.columns or features["day_of_week"].isna().any():
+            features["day_of_week"] = features["start_time"].dt.day_name()
+
+        numeric_placeholders = {
+            "home_offense_pass_rating": np.nan,
+            "home_offense_rush_rating": np.nan,
+            "home_defense_pass_rating": np.nan,
+            "home_defense_rush_rating": np.nan,
+            "home_pace_seconds_per_play": np.nan,
+            "home_offense_epa": np.nan,
+            "home_defense_epa": np.nan,
+            "home_offense_success_rate": np.nan,
+            "home_defense_success_rate": np.nan,
+            "home_travel_penalty": np.nan,
+            "home_rest_penalty": np.nan,
+            "home_weather_adjustment": np.nan,
+            "home_timezone_diff_hours": np.nan,
+            "away_offense_pass_rating": np.nan,
+            "away_offense_rush_rating": np.nan,
+            "away_defense_pass_rating": np.nan,
+            "away_defense_rush_rating": np.nan,
+            "away_pace_seconds_per_play": np.nan,
+            "away_offense_epa": np.nan,
+            "away_defense_epa": np.nan,
+            "away_offense_success_rate": np.nan,
+            "away_defense_success_rate": np.nan,
+            "away_travel_penalty": np.nan,
+            "away_rest_penalty": np.nan,
+            "away_weather_adjustment": np.nan,
+            "away_timezone_diff_hours": np.nan,
+            "home_points_for_avg": np.nan,
+            "home_points_against_avg": np.nan,
+            "home_point_diff_avg": np.nan,
+            "home_win_pct_recent": np.nan,
+            "home_prev_points_for": np.nan,
+            "home_prev_points_against": np.nan,
+            "home_prev_point_diff": np.nan,
+            "home_rest_days": np.nan,
+            "home_injury_total": 0.0,
+            "away_points_for_avg": np.nan,
+            "away_points_against_avg": np.nan,
+            "away_point_diff_avg": np.nan,
+            "away_win_pct_recent": np.nan,
+            "away_prev_points_for": np.nan,
+            "away_prev_points_against": np.nan,
+            "away_prev_point_diff": np.nan,
+            "away_rest_days": np.nan,
+            "away_injury_total": 0.0,
+            "wind_mph": np.nan,
+            "humidity": np.nan,
+        }
+        for col, default in numeric_placeholders.items():
+            if col not in features.columns:
+                features[col] = default
+
+        for idx, row in features.iterrows():
+            season = row.get("season")
+            home_team = row.get("home_team")
+            away_team = row.get("away_team")
+
+            if home_team:
+                strength = self._get_latest_team_strength(home_team, season)
+                if strength is not None:
+                    features.at[idx, "home_offense_pass_rating"] = strength.get("offense_pass_rating")
+                    features.at[idx, "home_offense_rush_rating"] = strength.get("offense_rush_rating")
+                    features.at[idx, "home_defense_pass_rating"] = strength.get("defense_pass_rating")
+                    features.at[idx, "home_defense_rush_rating"] = strength.get("defense_rush_rating")
+                    features.at[idx, "home_pace_seconds_per_play"] = strength.get("pace_seconds_per_play")
+                    features.at[idx, "home_offense_epa"] = strength.get("offense_epa")
+                    features.at[idx, "home_defense_epa"] = strength.get("defense_epa")
+                    features.at[idx, "home_offense_success_rate"] = strength.get("offense_success_rate")
+                    features.at[idx, "home_defense_success_rate"] = strength.get("defense_success_rate")
+                    features.at[idx, "home_travel_penalty"] = strength.get("travel_penalty")
+                    features.at[idx, "home_rest_penalty"] = strength.get("rest_penalty")
+                    features.at[idx, "home_weather_adjustment"] = strength.get("weather_adjustment")
+                    features.at[idx, "home_timezone_diff_hours"] = strength.get("avg_timezone_diff_hours")
+                history = self._get_latest_team_history(home_team, season)
+                if history is not None:
+                    features.at[idx, "home_points_for_avg"] = history.get("rolling_points_for")
+                    features.at[idx, "home_points_against_avg"] = history.get("rolling_points_against")
+                    features.at[idx, "home_point_diff_avg"] = history.get("rolling_point_diff")
+                    features.at[idx, "home_win_pct_recent"] = history.get("rolling_win_pct")
+                    features.at[idx, "home_prev_points_for"] = history.get("prev_points_for")
+                    features.at[idx, "home_prev_points_against"] = history.get("prev_points_against")
+                    features.at[idx, "home_prev_point_diff"] = history.get("prev_point_diff")
+                    features.at[idx, "home_rest_days"] = history.get("rest_days")
+                    if pd.isna(features.at[idx, "home_rest_penalty"]):
+                        features.at[idx, "home_rest_penalty"] = history.get("rest_penalty")
+                    if pd.isna(features.at[idx, "home_travel_penalty"]):
+                        features.at[idx, "home_travel_penalty"] = history.get("travel_penalty")
+                    if pd.isna(features.at[idx, "home_timezone_diff_hours"]):
+                        features.at[idx, "home_timezone_diff_hours"] = history.get("timezone_diff_hours")
+
+            if away_team:
+                strength = self._get_latest_team_strength(away_team, season)
+                if strength is not None:
+                    features.at[idx, "away_offense_pass_rating"] = strength.get("offense_pass_rating")
+                    features.at[idx, "away_offense_rush_rating"] = strength.get("offense_rush_rating")
+                    features.at[idx, "away_defense_pass_rating"] = strength.get("defense_pass_rating")
+                    features.at[idx, "away_defense_rush_rating"] = strength.get("defense_rush_rating")
+                    features.at[idx, "away_pace_seconds_per_play"] = strength.get("pace_seconds_per_play")
+                    features.at[idx, "away_offense_epa"] = strength.get("offense_epa")
+                    features.at[idx, "away_defense_epa"] = strength.get("defense_epa")
+                    features.at[idx, "away_offense_success_rate"] = strength.get("offense_success_rate")
+                    features.at[idx, "away_defense_success_rate"] = strength.get("defense_success_rate")
+                    features.at[idx, "away_travel_penalty"] = strength.get("travel_penalty")
+                    features.at[idx, "away_rest_penalty"] = strength.get("rest_penalty")
+                    features.at[idx, "away_weather_adjustment"] = strength.get("weather_adjustment")
+                    features.at[idx, "away_timezone_diff_hours"] = strength.get("avg_timezone_diff_hours")
+                history = self._get_latest_team_history(away_team, season)
+                if history is not None:
+                    features.at[idx, "away_points_for_avg"] = history.get("rolling_points_for")
+                    features.at[idx, "away_points_against_avg"] = history.get("rolling_points_against")
+                    features.at[idx, "away_point_diff_avg"] = history.get("rolling_point_diff")
+                    features.at[idx, "away_win_pct_recent"] = history.get("rolling_win_pct")
+                    features.at[idx, "away_prev_points_for"] = history.get("prev_points_for")
+                    features.at[idx, "away_prev_points_against"] = history.get("prev_points_against")
+                    features.at[idx, "away_prev_point_diff"] = history.get("prev_point_diff")
+                    features.at[idx, "away_rest_days"] = history.get("rest_days")
+                    if pd.isna(features.at[idx, "away_rest_penalty"]):
+                        features.at[idx, "away_rest_penalty"] = history.get("rest_penalty")
+                    if pd.isna(features.at[idx, "away_travel_penalty"]):
+                        features.at[idx, "away_travel_penalty"] = history.get("travel_penalty")
+                    if pd.isna(features.at[idx, "away_timezone_diff_hours"]):
+                        features.at[idx, "away_timezone_diff_hours"] = history.get("timezone_diff_hours")
+
+        fill_defaults = {col: 0.0 for col in numeric_placeholders.keys()}
+        features[list(fill_defaults.keys())] = features[list(fill_defaults.keys())].fillna(fill_defaults)
+
+        features["moneyline_diff"] = features["home_moneyline"] - features["away_moneyline"]
+        features["implied_prob_diff"] = features["home_implied_prob"] - features["away_implied_prob"]
+        features["implied_prob_sum"] = features["home_implied_prob"] + features["away_implied_prob"]
+
+        return features
+
+    def prepare_upcoming_player_features(
+        self,
+        upcoming_games: pd.DataFrame,
+        starters_per_position: Optional[Dict[str, int]] = None,
+    ) -> pd.DataFrame:
+        if (
+            self.player_feature_frame is None
+            or self.player_feature_frame.empty
+            or upcoming_games.empty
+        ):
+            return pd.DataFrame()
+
+        if starters_per_position is None:
+            starters_per_position = {"QB": 1, "RB": 2, "WR": 3, "TE": 1}
+
+        position_groups = {
+            "QB": {"QB"},
+            "RB": {"RB", "HB", "FB"},
+            "WR": {"WR"},
+            "TE": {"TE"},
+        }
+
+        latest_players = (
+            self.player_feature_frame.sort_values("start_time")
+            .groupby("player_id", as_index=False)
+            .tail(1)
+        )
+        latest_players["team"] = latest_players["team"].apply(normalize_team_abbr)
+        latest_players = latest_players[latest_players["team"].notna()]
+
+        season_source = self.player_feature_frame.copy()
+        season_source["team"] = season_source["team"].apply(normalize_team_abbr)
+        season_source = season_source[season_source["team"].isin(TEAM_ABBR_CANONICAL.keys())]
+
+        if not season_source.empty:
+            aggregate_candidates = [
+                "passing_attempts",
+                "passing_yards",
+                "passing_tds",
+                "rushing_attempts",
+                "rushing_yards",
+                "rushing_tds",
+                "receiving_targets",
+                "receiving_yards",
+                "receptions",
+                "receiving_tds",
+                "fantasy_points",
+                "snap_count",
+            ]
+            present_metrics = [
+                col for col in aggregate_candidates if col in season_source.columns
+            ]
+            if present_metrics:
+                season_totals = (
+                    season_source.groupby(["player_id", "team"], as_index=False)[
+                        present_metrics
+                    ].sum(min_count=1)
+                )
+                rename_map = {col: f"season_{col}" for col in present_metrics}
+                season_totals = season_totals.rename(columns=rename_map)
+                latest_players = latest_players.merge(
+                    season_totals,
+                    on=["player_id", "team"],
+                    how="left",
+                )
+
+        games = upcoming_games.copy()
+        games["start_time"] = pd.to_datetime(games["start_time"], utc=True, errors="coerce")
+        games = games[games["start_time"].notna()]
+        eastern = ZoneInfo("America/New_York")
+        if "local_start_time" in games.columns:
+            games["local_start_time"] = pd.to_datetime(
+                games["local_start_time"], utc=True, errors="coerce"
+            ).dt.tz_convert(eastern)
+        else:
+            games["local_start_time"] = games["start_time"].dt.tz_convert(eastern)
+
+        if "day_of_week" in games.columns:
+            games["day_of_week"] = games["day_of_week"].where(
+                games["day_of_week"].notna(), games["local_start_time"].dt.day_name()
+            )
+        else:
+            games["day_of_week"] = games["local_start_time"].dt.day_name()
+        games["home_team"] = games["home_team"].apply(normalize_team_abbr)
+        games["away_team"] = games["away_team"].apply(normalize_team_abbr)
+
+        selected_rows: List[pd.Series] = []
+
+        for game in games.itertuples():
+            game_id = getattr(game, "game_id")
+            season = getattr(game, "season", None)
+            week = getattr(game, "week", None)
+            start_time = getattr(game, "start_time")
+            venue = getattr(game, "venue", None)
+            city = getattr(game, "city", None)
+            state = getattr(game, "state", None)
+            day_of_week = getattr(game, "day_of_week", None)
+            referee = getattr(game, "referee", None)
+            weather = getattr(game, "weather_conditions", None)
+            temperature = getattr(game, "temperature_f", None)
+            home_team = getattr(game, "home_team", None)
+            away_team = getattr(game, "away_team", None)
+
+            for team, opponent in ((away_team, home_team), (home_team, away_team)):
+                if not team or not opponent:
+                    continue
+
+                candidates = latest_players[latest_players["team"] == team]
+                if candidates.empty:
+                    continue
+
+                chosen_players: List[pd.Series] = []
+                used_player_ids: set[str] = set()
+
+                for pos_key, count in starters_per_position.items():
+                    allowed_positions = position_groups.get(pos_key, {pos_key})
+                    position_candidates = candidates[
+                        candidates["position"].isin(allowed_positions)
+                    ]
+                    if position_candidates.empty:
+                        continue
+                    position_candidates = position_candidates.copy()
+
+                    if pos_key == "QB":
+                        sort_cols = [
+                            "season_passing_attempts",
+                            "season_passing_yards",
+                            "season_fantasy_points",
+                            "season_snap_count",
+                            "passing_attempts",
+                            "passing_yards",
+                            "fantasy_points",
+                            "snap_count",
+                        ]
+                    elif pos_key == "RB":
+                        sort_cols = [
+                            "season_rushing_attempts",
+                            "season_rushing_yards",
+                            "season_receiving_targets",
+                            "season_snap_count",
+                            "season_fantasy_points",
+                            "rushing_attempts",
+                            "rushing_yards",
+                            "receiving_targets",
+                            "snap_count",
+                            "fantasy_points",
+                        ]
+                    elif pos_key == "WR":
+                        sort_cols = [
+                            "season_receiving_targets",
+                            "season_receiving_yards",
+                            "season_receptions",
+                            "season_fantasy_points",
+                            "receiving_targets",
+                            "receiving_yards",
+                            "receptions",
+                            "fantasy_points",
+                        ]
+                    elif pos_key == "TE":
+                        sort_cols = [
+                            "season_receiving_targets",
+                            "season_receptions",
+                            "season_receiving_yards",
+                            "season_fantasy_points",
+                            "receiving_targets",
+                            "receptions",
+                            "receiving_yards",
+                            "fantasy_points",
+                        ]
+                    else:
+                        sort_cols = [
+                            "season_snap_count",
+                            "season_fantasy_points",
+                            "snap_count",
+                            "fantasy_points",
+                        ]
+
+                    for col in sort_cols:
+                        if col not in position_candidates.columns:
+                            position_candidates[col] = 0.0
+                        else:
+                            position_candidates[col] = position_candidates[col].fillna(0.0)
+
+                    ascending_flags = [False] * len(sort_cols)
+                    position_candidates = position_candidates.sort_values(
+                        sort_cols, ascending=ascending_flags
+                    )
+                    pos_selected = 0
+                    for _, player_row in position_candidates.iterrows():
+                        player_id = player_row.get("player_id")
+                        if player_id in used_player_ids:
+                            continue
+                        chosen_players.append(player_row)
+                        used_player_ids.add(player_id)
+                        pos_selected += 1
+                        if pos_selected >= count:
+                            break
+
+                if not chosen_players:
+                    continue
+
+                for player_row in chosen_players:
+                    row_copy = player_row.copy()
+                    row_copy["game_id"] = game_id
+                    row_copy["season"] = season
+                    row_copy["week"] = week
+                    row_copy["start_time"] = start_time
+                    row_copy["local_start_time"] = getattr(game, "local_start_time", pd.NaT)
+                    row_copy["venue"] = venue
+                    row_copy["city"] = city
+                    row_copy["state"] = state
+                    row_copy["day_of_week"] = day_of_week
+                    row_copy["referee"] = referee
+                    row_copy["weather_conditions"] = weather
+                    row_copy["temperature_f"] = temperature
+                    row_copy["home_team"] = home_team
+                    row_copy["away_team"] = away_team
+                    row_copy["opponent"] = opponent
+
+                    strength = self._get_latest_team_strength(team, season)
+                    if strength is not None:
+                        row_copy["offense_pass_rating"] = strength.get("offense_pass_rating")
+                        row_copy["offense_rush_rating"] = strength.get("offense_rush_rating")
+                        row_copy["defense_pass_rating"] = strength.get("defense_pass_rating")
+                        row_copy["defense_rush_rating"] = strength.get("defense_rush_rating")
+                        row_copy["pace_seconds_per_play"] = strength.get("pace_seconds_per_play")
+                        row_copy["offense_epa"] = strength.get("offense_epa")
+                        row_copy["defense_epa"] = strength.get("defense_epa")
+                        row_copy["offense_success_rate"] = strength.get("offense_success_rate")
+                        row_copy["defense_success_rate"] = strength.get("defense_success_rate")
+                        row_copy["travel_penalty"] = strength.get("travel_penalty")
+                        row_copy["rest_penalty"] = strength.get("rest_penalty")
+                        row_copy["weather_adjustment"] = strength.get("weather_adjustment")
+                        row_copy["avg_timezone_diff_hours"] = strength.get("avg_timezone_diff_hours")
+
+                    opp_strength = self._get_latest_team_strength(opponent, season)
+                    if opp_strength is not None:
+                        row_copy["opp_offense_pass_rating"] = opp_strength.get("offense_pass_rating")
+                        row_copy["opp_offense_rush_rating"] = opp_strength.get("offense_rush_rating")
+                        row_copy["opp_defense_pass_rating"] = opp_strength.get("defense_pass_rating")
+                        row_copy["opp_defense_rush_rating"] = opp_strength.get("defense_rush_rating")
+                        row_copy["opp_pace_seconds_per_play"] = opp_strength.get("pace_seconds_per_play")
+                        row_copy["opp_offense_epa"] = opp_strength.get("offense_epa")
+                        row_copy["opp_defense_epa"] = opp_strength.get("defense_epa")
+                        row_copy["opp_offense_success_rate"] = opp_strength.get("offense_success_rate")
+                        row_copy["opp_defense_success_rate"] = opp_strength.get("defense_success_rate")
+                        row_copy["opp_travel_penalty"] = opp_strength.get("travel_penalty")
+                        row_copy["opp_rest_penalty"] = opp_strength.get("rest_penalty")
+                        row_copy["opp_weather_adjustment"] = opp_strength.get("weather_adjustment")
+                        row_copy["opp_timezone_diff_hours"] = opp_strength.get("avg_timezone_diff_hours")
+
+                    selected_rows.append(row_copy)
+
+        if not selected_rows:
+            return pd.DataFrame()
+
+        player_features = pd.DataFrame(selected_rows)
+
+        # Merge contextual averages for updated venue/day/ref when available.
+        if self.context_feature_frame is not None and not self.context_feature_frame.empty:
+            contextual = self.context_feature_frame.rename(
+                columns={
+                    "avg_rush_yards": "avg_rush_yards_ctx",
+                    "avg_rec_yards": "avg_rec_yards_ctx",
+                    "avg_receptions": "avg_receptions_ctx",
+                    "avg_rush_tds": "avg_rush_tds_ctx",
+                    "avg_rec_tds": "avg_rec_tds_ctx",
+                }
+            )
+            player_features = player_features.merge(
+                contextual,
+                on=["team", "venue", "day_of_week", "referee"],
+                how="left",
+            )
+            for src, dest in [
+                ("avg_rush_yards_ctx", "avg_rush_yards"),
+                ("avg_rec_yards_ctx", "avg_rec_yards"),
+                ("avg_receptions_ctx", "avg_receptions"),
+                ("avg_rush_tds_ctx", "avg_rush_tds"),
+                ("avg_rec_tds_ctx", "avg_rec_tds"),
+            ]:
+                if src in player_features.columns:
+                    player_features[dest] = player_features[dest].where(
+                        player_features[dest].notna(), player_features[src]
+                    )
+                    player_features = player_features.drop(columns=[src])
+
+        return player_features
+
+    def _compute_team_unit_strength(
+        self, player_stats: pd.DataFrame, advanced_metrics: Optional[pd.DataFrame] = None
+    ) -> pd.DataFrame:
+        base_columns = [
+            "season",
+            "week",
+            "team",
+            "offense_pass_rating",
+            "offense_rush_rating",
+            "defense_pass_rating",
+            "defense_rush_rating",
+            "pace_seconds_per_play",
+            "offense_epa",
+            "defense_epa",
+            "offense_success_rate",
+            "defense_success_rate",
+            "travel_penalty",
+            "rest_penalty",
+            "weather_adjustment",
+            "avg_timezone_diff_hours",
+        ]
+
+        if player_stats.empty and (advanced_metrics is None or advanced_metrics.empty):
+            return pd.DataFrame(columns=base_columns)
+
+        stats = player_stats.copy()
+        numeric_cols = [
+            "rushing_yards",
+            "rushing_attempts",
+            "receiving_yards",
+            "receiving_targets",
+            "passing_yards",
+            "passing_attempts",
+            "rushing_tds",
+            "passing_tds",
+        ]
+        for col in numeric_cols:
+            if col not in stats.columns:
+                stats[col] = 0.0
+            stats[col] = stats[col].fillna(0.0)
+
+        if "home_team" in stats.columns and "away_team" in stats.columns:
+            stats = stats.copy()
+            stats["opponent"] = np.where(
+                stats["team"] == stats["home_team"], stats["away_team"], stats["home_team"]
+            )
+        else:
+            stats["opponent"] = np.nan
+
+        offense = (
+            stats.dropna(subset=["team", "season", "week"])
+            .groupby(["season", "week", "team"], as_index=False)
+            .agg(
+                rushing_yards=pd.NamedAgg(column="rushing_yards", aggfunc="sum"),
+                rushing_attempts=pd.NamedAgg(column="rushing_attempts", aggfunc="sum"),
+                receiving_yards=pd.NamedAgg(column="receiving_yards", aggfunc="sum"),
+                receiving_targets=pd.NamedAgg(column="receiving_targets", aggfunc="sum"),
+                passing_yards=pd.NamedAgg(column="passing_yards", aggfunc="sum"),
+                passing_attempts=pd.NamedAgg(column="passing_attempts", aggfunc="sum"),
+                rushing_tds=pd.NamedAgg(column="rushing_tds", aggfunc="sum"),
+                passing_tds=pd.NamedAgg(column="passing_tds", aggfunc="sum"),
+            )
+        )
+
+        defense = (
+            stats.dropna(subset=["opponent", "season", "week"])
+            .groupby(["season", "week", "opponent"], as_index=False)
+            .agg(
+                opp_rushing_yards=pd.NamedAgg(column="rushing_yards", aggfunc="sum"),
+                opp_rushing_attempts=pd.NamedAgg(column="rushing_attempts", aggfunc="sum"),
+                opp_receiving_yards=pd.NamedAgg(column="receiving_yards", aggfunc="sum"),
+                opp_receiving_targets=pd.NamedAgg(column="receiving_targets", aggfunc="sum"),
+                opp_passing_yards=pd.NamedAgg(column="passing_yards", aggfunc="sum"),
+                opp_passing_attempts=pd.NamedAgg(column="passing_attempts", aggfunc="sum"),
+            )
+            .rename(columns={"opponent": "team"})
+        )
+
+        merged = offense.merge(defense, on=["season", "week", "team"], how="left")
+        merged["plays"] = merged["rushing_attempts"] + merged["passing_attempts"]
+        merged["yards_per_play"] = np.where(
+            merged["plays"] > 0,
+            (merged["rushing_yards"] + merged["passing_yards"]) / merged["plays"],
+            np.nan,
+        )
+        merged["rush_per_attempt"] = np.where(
+            merged["rushing_attempts"] > 0,
+            merged["rushing_yards"] / merged["rushing_attempts"],
+            np.nan,
+        )
+        merged["pass_per_attempt"] = np.where(
+            merged["passing_attempts"] > 0,
+            merged["passing_yards"] / merged["passing_attempts"],
+            np.nan,
+        )
+        merged["pace_seconds_per_play"] = np.where(
+            merged["plays"] > 0,
+            3600.0 / merged["plays"],
+            np.nan,
+        )
+
+        merged["offense_success_rate"] = np.clip(
+            np.where(
+                merged["plays"] > 0,
+                (merged["rushing_yards"] + merged["passing_yards"]) / (merged["plays"] * 4.0),
+                np.nan,
+            ),
+            0,
+            1,
+        )
+
+        merged["allowed_rush_per_attempt"] = np.where(
+            merged["opp_rushing_attempts"] > 0,
+            merged["opp_rushing_yards"] / merged["opp_rushing_attempts"],
+            np.nan,
+        )
+        merged["allowed_pass_per_attempt"] = np.where(
+            merged["opp_passing_attempts"] > 0,
+            merged["opp_passing_yards"] / merged["opp_passing_attempts"],
+            np.nan,
+        )
+        merged["defense_success_rate"] = np.clip(
+            np.where(
+                merged["opp_rushing_attempts"] + merged["opp_passing_attempts"] > 0,
+                1
+                - (
+                    (merged["opp_rushing_yards"] + merged["opp_passing_yards"]) /
+                    ((merged["opp_rushing_attempts"] + merged["opp_passing_attempts"]) * 4.0)
+                ),
+                np.nan,
+            ),
+            0,
+            1,
+        )
+
+        league = (
+            merged.groupby(["season", "week"], as_index=False)[
+                ["rush_per_attempt", "pass_per_attempt", "allowed_rush_per_attempt", "allowed_pass_per_attempt", "yards_per_play"]
+            ]
+            .mean()
+            .rename(
+                columns={
+                    "rush_per_attempt": "league_rush_per_attempt",
+                    "pass_per_attempt": "league_pass_per_attempt",
+                    "allowed_rush_per_attempt": "league_allowed_rush_per_attempt",
+                    "allowed_pass_per_attempt": "league_allowed_pass_per_attempt",
+                    "yards_per_play": "league_yards_per_play",
+                }
+            )
+        )
+
+        merged = merged.merge(league, on=["season", "week"], how="left")
+        merged["offense_rush_rating"] = (
+            merged["rush_per_attempt"] - merged["league_rush_per_attempt"]
+        )
+        merged["offense_pass_rating"] = (
+            merged["pass_per_attempt"] - merged["league_pass_per_attempt"]
+        )
+        merged["defense_rush_rating"] = (
+            merged["league_allowed_rush_per_attempt"] - merged["allowed_rush_per_attempt"]
+        )
+        merged["defense_pass_rating"] = (
+            merged["league_allowed_pass_per_attempt"] - merged["allowed_pass_per_attempt"]
+        )
+
+        merged["offense_epa"] = merged["offense_pass_rating"] + merged["offense_rush_rating"]
+        merged["defense_epa"] = merged["defense_pass_rating"] + merged["defense_rush_rating"]
+        merged["travel_penalty"] = np.nan
+        merged["rest_penalty"] = np.nan
+        merged["weather_adjustment"] = np.nan
+
+        result = merged[[
+            "season",
+            "week",
+            "team",
+            "offense_pass_rating",
+            "offense_rush_rating",
+            "defense_pass_rating",
+            "defense_rush_rating",
+            "pace_seconds_per_play",
+            "offense_epa",
+            "defense_epa",
+            "offense_success_rate",
+            "defense_success_rate",
+            "travel_penalty",
+            "rest_penalty",
+            "weather_adjustment",
+            "timezone_diff_hours",
+        ]]
+
+        result = result.rename(columns={"timezone_diff_hours": "avg_timezone_diff_hours"})
+
+        if advanced_metrics is not None and not advanced_metrics.empty:
+            adv_subset = advanced_metrics[[
+                "season",
+                "week",
+                "team",
+                "pace_seconds_per_play",
+                "offense_epa",
+                "defense_epa",
+                "offense_success_rate",
+                "defense_success_rate",
+                "travel_penalty",
+                "rest_penalty",
+                "weather_adjustment",
+            ]].drop_duplicates()
+            if result.empty:
+                result = adv_subset
+                for col in [
+                    "offense_pass_rating",
+                    "offense_rush_rating",
+                    "defense_pass_rating",
+                    "defense_rush_rating",
+                ]:
+                    if col not in result:
+                        result[col] = np.nan
+            else:
+                result = result.merge(
+                    adv_subset,
+                    on=["season", "week", "team"],
+                    how="left",
+                    suffixes=("", "_adv"),
+                )
+                for col in [
+                    "pace_seconds_per_play",
+                    "offense_epa",
+                    "defense_epa",
+                    "offense_success_rate",
+                    "defense_success_rate",
+                    "travel_penalty",
+                    "rest_penalty",
+                    "weather_adjustment",
+                ]:
+                    adv_col = f"{col}_adv"
+                    if adv_col in result:
+                        result[col] = result[col].combine_first(result[adv_col])
+                        result.drop(columns=[adv_col], inplace=True)
+
+        return result[base_columns]
+
+    def _compute_contextual_averages(self, player_stats: pd.DataFrame) -> pd.DataFrame:
+        if player_stats.empty:
+            return pd.DataFrame(
+                columns=
+                [
+                    "team",
+                    "venue",
+                    "day_of_week",
+                    "referee",
+                    "avg_rush_yards",
+                    "avg_rec_yards",
+                    "avg_receptions",
+                    "avg_rush_tds",
+                    "avg_rec_tds",
+                ]
+            )
+
+        context = (
+            player_stats.groupby(["team", "venue", "day_of_week", "referee"])
+            .agg(
+                avg_rush_yards=pd.NamedAgg(column="rushing_yards", aggfunc="mean"),
+                avg_rec_yards=pd.NamedAgg(column="receiving_yards", aggfunc="mean"),
+                avg_receptions=pd.NamedAgg(column="receptions", aggfunc="mean"),
+                avg_rush_tds=pd.NamedAgg(column="rushing_tds", aggfunc="mean"),
+                avg_rec_tds=pd.NamedAgg(column="receiving_tds", aggfunc="mean"),
+            )
+            .reset_index()
+        )
+        return context
+
+    def _compute_team_game_rolling_stats(self, games: pd.DataFrame) -> pd.DataFrame:
+        """Create rolling scoring, travel, and rest indicators for each team game."""
+
+        base_columns = [
+            "game_id",
+            "season",
+            "week",
+            "start_time",
+            "team",
+            "opponent",
+            "is_home",
+            "rolling_points_for",
+            "rolling_points_against",
+            "rolling_point_diff",
+            "rolling_win_pct",
+            "prev_points_for",
+            "prev_points_against",
+            "prev_point_diff",
+            "rest_days",
+            "rest_penalty",
+            "timezone_diff_hours",
+            "travel_penalty",
+        ]
+
+        if games.empty:
+            return pd.DataFrame(columns=base_columns)
+
+        games = games.copy()
+        games["start_time"] = pd.to_datetime(games["start_time"], utc=True, errors="coerce")
+        games = games[games["start_time"].notna()]
+        games["home_team"] = games["home_team"].apply(normalize_team_abbr)
+        games["away_team"] = games["away_team"].apply(normalize_team_abbr)
+        games = games.dropna(subset=["home_team", "away_team"])
+
+        def _team_zone(team: Optional[str]) -> ZoneInfo:
+            tz_name = TEAM_TIMEZONES.get(team or "", "UTC")
+            try:
+                return ZoneInfo(tz_name)
+            except Exception:
+                return ZoneInfo("UTC")
+
+        def _tz_offset_hours(ts: dt.datetime, team: Optional[str]) -> float:
+            if ts is None or pd.isna(ts):
+                return 0.0
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=dt.timezone.utc)
+            zone = _team_zone(team)
+            offset = ts.astimezone(zone).utcoffset()
+            if offset is None:
+                return 0.0
+            return offset.total_seconds() / 3600.0
+
+        home = games[[
+            "game_id",
+            "season",
+            "week",
+            "start_time",
+            "home_team",
+            "away_team",
+            "home_score",
+            "away_score",
+        ]].rename(
+            columns={
+                "home_team": "team",
+                "away_team": "opponent",
+                "home_score": "points_for",
+                "away_score": "points_against",
+            }
+        )
+        home["is_home"] = True
+        home["venue_team"] = home["team"]
+
+        away = games[[
+            "game_id",
+            "season",
+            "week",
+            "start_time",
+            "away_team",
+            "home_team",
+            "away_score",
+            "home_score",
+        ]].rename(
+            columns={
+                "away_team": "team",
+                "home_team": "opponent",
+                "away_score": "points_for",
+                "home_score": "points_against",
+            }
+        )
+        away["is_home"] = False
+        away["venue_team"] = away["opponent"]
+
+        team_games = pd.concat([home, away], ignore_index=True)
+        team_games = team_games.dropna(subset=["team", "opponent"])
+
+        team_games["team"] = team_games["team"].apply(normalize_team_abbr)
+        team_games["opponent"] = team_games["opponent"].apply(normalize_team_abbr)
+        team_games = team_games.dropna(subset=["team", "opponent"])
+
+        team_games["timezone_diff_hours"] = team_games.apply(
+            lambda row: abs(
+                _tz_offset_hours(row["start_time"], row["team"]) -
+                _tz_offset_hours(row["start_time"], row.get("venue_team"))
+            ),
+            axis=1,
+        )
+
+        team_games = team_games.sort_values([
+            "team",
+            "season",
+            "start_time",
+            "game_id",
+        ]).reset_index(drop=True)
+
+        def compute_group(group: pd.DataFrame) -> pd.DataFrame:
+            group = group.sort_values("start_time").copy()
+            win_flag = np.where(
+                group["points_for"].notna() & group["points_against"].notna(),
+                (group["points_for"] > group["points_against"]).astype(float),
+                np.nan,
+            )
+
+            group["prev_points_for"] = group["points_for"].shift(1)
+            group["prev_points_against"] = group["points_against"].shift(1)
+            group["prev_point_diff"] = (
+                group["prev_points_for"] - group["prev_points_against"]
+            )
+
+            rolling_points_for = (
+                group["points_for"].rolling(window=5, min_periods=1).mean()
+            )
+            rolling_points_against = (
+                group["points_against"].rolling(window=5, min_periods=1).mean()
+            )
+            rolling_point_diff = (
+                (group["points_for"] - group["points_against"]).rolling(window=5, min_periods=1).mean()
+            )
+            rolling_win_pct = (
+                pd.Series(win_flag, index=group.index)
+                .rolling(window=5, min_periods=1)
+                .mean()
+            )
+
+            group["rolling_points_for"] = rolling_points_for.shift(1)
+            group["rolling_points_against"] = rolling_points_against.shift(1)
+            group["rolling_point_diff"] = rolling_point_diff.shift(1)
+            group["rolling_win_pct"] = rolling_win_pct.shift(1)
+
+            rest_days = group["start_time"].diff().dt.total_seconds() / 86400.0
+            group["rest_days"] = rest_days
+            group["rest_penalty"] = rest_days.apply(
+                lambda value: max(0.0, 6.0 - value) if pd.notna(value) else np.nan
+            )
+            group["travel_penalty"] = np.where(
+                group["is_home"],
+                0.0,
+                group["timezone_diff_hours"].fillna(0.0) / 3.0,
+            )
+
+            return group
+
+        grouped_frames: List[pd.DataFrame] = []
+        for _, group in team_games.groupby(["team", "season"], sort=False):
+            grouped_frames.append(compute_group(group))
+
+        if grouped_frames:
+            team_games = pd.concat(grouped_frames, ignore_index=True)
+        else:
+            team_games = team_games.iloc[0:0]
+
+        team_games = team_games.drop(columns=["venue_team"], errors="ignore")
+
+        return team_games[base_columns]
+
+
+# ---------------------------------------------------------------------------
+# Modeling pipeline
+# ---------------------------------------------------------------------------
+
+
+class ModelTrainer:
+    def __init__(self, engine: Engine, db: NFLDatabase, run_id: Optional[str] = None):
+        self.engine = engine
+        self.db = db
+        self.feature_builder = FeatureBuilder(engine)
+        self.run_id = run_id or uuid.uuid4().hex
+        self.model_uncertainty: Dict[str, Dict[str, float]] = {}
+
+    # ------------------------------------------------------------------
+    # Chronological splitting utilities
+    # ------------------------------------------------------------------
+
+    def _sort_by_time(self, df: pd.DataFrame) -> pd.DataFrame:
+        if "start_time" in df.columns:
+            return df.sort_values("start_time")
+        if {"season", "week"}.issubset(df.columns):
+            return df.sort_values(["season", "week"])
+        if "week" in df.columns:
+            return df.sort_values("week")
+        return df.sort_index()
+
+    def _chronological_split(
+        self,
+        df: pd.DataFrame,
+        holdout_fraction: float = 0.2,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        df_sorted = self._sort_by_time(df).reset_index(drop=True)
+        if len(df_sorted) < 5:
+            split_index = max(1, len(df_sorted) - 1)
+        else:
+            holdout_size = max(1, int(len(df_sorted) * holdout_fraction))
+            if holdout_size >= len(df_sorted):
+                holdout_size = max(1, len(df_sorted) - 1)
+            split_index = len(df_sorted) - holdout_size
+
+        if split_index <= 0 or split_index >= len(df_sorted):
+            split_index = max(1, len(df_sorted) - 1)
+
+        train_df = df_sorted.iloc[:split_index]
+        test_df = df_sorted.iloc[split_index:]
+        return train_df, test_df, df_sorted
+
+    def _build_time_series_cv(self, n_samples: int) -> TimeSeriesSplit:
+        if n_samples < 3:
+            raise ValueError("At least 3 samples are required for time series CV.")
+
+        n_splits = min(5, max(2, n_samples - 1))
+        if n_splits >= n_samples:
+            n_splits = n_samples - 1
+        return TimeSeriesSplit(n_splits=n_splits)
+
+    @staticmethod
+    def _gb_param_grid(prefix: str) -> Dict[str, List[Any]]:
+        """Gradient boosting hyperparameter search space helper."""
+
+        return {
+            f"{prefix}learning_rate": [0.01, 0.05, 0.1, 0.2],
+            f"{prefix}n_estimators": [100, 200, 300, 400],
+            f"{prefix}max_depth": [2, 3, 4],
+            f"{prefix}subsample": [0.6, 0.8, 1.0],
+        }
+
+    def train(self) -> Dict[str, Pipeline]:
+        datasets = self.feature_builder.build_features()
+        models: Dict[str, Pipeline] = {}
+
+        for target, df in datasets.items():
+            if target == "game_outcome":
+                model = self._train_game_models(df)
+                models.update(model)
+                continue
+
+            model = self._train_regression_model(df, target)
+            if model is not None:
+                models[target] = model
+        return models
+
+    def _train_regression_model(self, df: pd.DataFrame, target: str) -> Optional[Pipeline]:
+        if len(df) < 20 or df[target].nunique() <= 1:
+            logging.warning(
+                "Not enough data to train %s model (rows=%d, unique targets=%d).", 
+                target,
+                len(df),
+                df[target].nunique(),
+            )
+            return None
+
+        numeric_features = [
+            "week",
+            "temperature_f",
+            "wind_mph",
+            "humidity",
+            "offense_pass_rating",
+            "offense_rush_rating",
+            "defense_pass_rating",
+            "defense_rush_rating",
+            "pace_seconds_per_play",
+            "offense_epa",
+            "defense_epa",
+            "offense_success_rate",
+            "defense_success_rate",
+            "travel_penalty",
+            "rest_penalty",
+            "weather_adjustment",
+            "avg_timezone_diff_hours",
+            "opp_offense_pass_rating",
+            "opp_offense_rush_rating",
+            "opp_defense_pass_rating",
+            "opp_defense_rush_rating",
+            "opp_pace_seconds_per_play",
+            "opp_offense_epa",
+            "opp_defense_epa",
+            "opp_offense_success_rate",
+            "opp_defense_success_rate",
+            "opp_travel_penalty",
+            "opp_rest_penalty",
+            "opp_weather_adjustment",
+            "opp_timezone_diff_hours",
+            "avg_rush_yards",
+            "avg_rec_yards",
+            "avg_receptions",
+            "avg_rush_tds",
+            "avg_rec_tds",
+            "snap_count",
+            "receiving_targets",
+            "home_injury_total",
+            "away_injury_total",
+        ]
+        categorical_features = [
+            "team",
+            "opponent",
+            "venue",
+            "day_of_week",
+            "referee",
+            "position",
+        ]
+
+        available_numeric = [
+            col for col in numeric_features if col in df.columns and df[col].notna().any()
+        ]
+        dropped_numeric = sorted(set(numeric_features) - set(available_numeric))
+        if dropped_numeric:
+            logging.debug(
+                "Dropping numeric features with no observed values for %s model: %s",
+                target,
+                ", ".join(dropped_numeric),
+            )
+
+        available_categorical = [
+            col for col in categorical_features if col in df.columns and df[col].notna().any()
+        ]
+        dropped_categorical = sorted(set(categorical_features) - set(available_categorical))
+        if dropped_categorical:
+            logging.debug(
+                "Dropping categorical features with no observed values for %s model: %s",
+                target,
+                ", ".join(dropped_categorical),
+            )
+
+        if not available_numeric and not available_categorical:
+            logging.warning(
+                "No usable features with observed values available to train %s model; skipping.",
+                target,
+            )
+            return None
+
+        feature_columns = list(available_numeric + available_categorical)
+
+        train_df, test_df, sorted_df = self._chronological_split(df)
+        X_train = train_df[feature_columns]
+        y_train = train_df[target]
+        X_test = test_df[feature_columns]
+        y_test = test_df[target]
+
+        transformers = []
+        if available_numeric:
+            transformers.append(
+                (
+                    "num",
+                    Pipeline([("imputer", SimpleImputer()), ("scaler", StandardScaler())]),
+                    available_numeric,
+                )
+            )
+        if available_categorical:
+            transformers.append(
+                (
+                    "cat",
+                    Pipeline([
+                        (
+                            "imputer",
+                            SimpleImputer(strategy="constant", fill_value="missing"),
+                        ),
+                        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+                    ]),
+                    available_categorical,
+                )
+            )
+
+        preprocessor = ColumnTransformer(transformers=transformers)
+
+        baseline_model = Pipeline([
+            ("preprocessor", clone(preprocessor)),
+            ("regressor", GradientBoostingRegressor(random_state=42)),
+        ])
+
+        baseline_model.fit(X_train, y_train)
+        baseline_pred = baseline_model.predict(X_test)
+        baseline_r2 = baseline_model.score(X_test, y_test)
+        baseline_mae = mean_absolute_error(y_test, baseline_pred)
+        baseline_rmse = float(np.sqrt(mean_squared_error(y_test, baseline_pred)))
+        logging.info(
+            "Trained %s model (baseline GBM), R^2=%.3f on holdout (MAE=%.3f, RMSE=%.3f)",
+            target,
+            baseline_r2,
+            baseline_mae,
+            baseline_rmse,
+        )
+        self.db.record_backtest_metrics(
+            self.run_id,
+            f"{target}_baseline",
+            {"r2": baseline_r2, "mae": baseline_mae, "rmse": baseline_rmse},
+            sample_size=len(y_test),
+        )
+
+        tuned_model = Pipeline([
+            ("preprocessor", clone(preprocessor)),
+            ("regressor", GradientBoostingRegressor(random_state=42)),
+        ])
+
+        try:
+            cv = self._build_time_series_cv(len(X_train))
+        except ValueError as exc:
+            logging.warning(
+                "Skipping hyperparameter tuning for %s due to insufficient data: %s",
+                target,
+                exc,
+            )
+            best_model = tuned_model.fit(X_train, y_train)
+        else:
+            search = RandomizedSearchCV(
+                estimator=tuned_model,
+                param_distributions=self._gb_param_grid("regressor__"),
+                n_iter=10,
+                scoring="neg_mean_absolute_error",
+                cv=cv,
+                random_state=42,
+                n_jobs=-1,
+            )
+            search.fit(X_train, y_train)
+            best_model: Pipeline = search.best_estimator_
+            logging.info(
+                "Best parameters for %s model: %s (CV MAE=%.3f)",
+                target,
+                search.best_params_,
+                -search.best_score_,
+            )
+
+        rf_pipeline = Pipeline([
+            ("preprocessor", clone(preprocessor)),
+            (
+                "regressor",
+                RandomForestRegressor(
+                    n_estimators=400, random_state=42, min_samples_leaf=2, n_jobs=-1
+                ),
+            ),
+        ])
+
+        final_estimator = GradientBoostingRegressor(
+            random_state=42, learning_rate=0.05, max_depth=3, n_estimators=200
+        )
+
+        ensemble = StackingRegressor(
+            estimators=[
+                ("gbm", clone(best_model)),
+                ("rf", rf_pipeline),
+            ],
+            final_estimator=final_estimator,
+            passthrough=False,
+            n_jobs=-1,
+        )
+
+        ensemble.fit(X_train, y_train)
+        y_pred = ensemble.predict(X_test)
+        r2 = ensemble.score(X_test, y_test)
+        mae = mean_absolute_error(y_test, y_pred)
+        rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+        logging.info(
+            "%s holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
+            target,
+            r2,
+            mae,
+            rmse,
+        )
+
+        self.db.record_backtest_metrics(
+            self.run_id,
+            target,
+            {"r2": r2, "mae": mae, "rmse": rmse},
+            sample_size=len(y_test),
+        )
+        self.model_uncertainty[target] = {"rmse": rmse, "mae": mae}
+
+        ensemble.fit(sorted_df[feature_columns], sorted_df[target])
+        setattr(ensemble, "feature_columns", feature_columns)
+        setattr(ensemble, "target_name", target)
+        return ensemble
+
+
+    def _train_game_models(self, df: pd.DataFrame) -> Dict[str, Pipeline]:
+        if len(df) < 20 or df["game_result"].nunique() <= 1:
+            logging.warning(
+                "Not enough completed games (%d) with outcomes to train game-level models.",
+                len(df),
+            )
+            return {}
+
+        df = df.copy()
+
+        numeric_features = [
+            "week",
+            "temperature_f",
+            "wind_mph",
+            "humidity",
+            "home_moneyline",
+            "away_moneyline",
+            "home_implied_prob",
+            "away_implied_prob",
+            "moneyline_diff",
+            "implied_prob_diff",
+            "implied_prob_sum",
+            "home_offense_pass_rating",
+            "home_offense_rush_rating",
+            "home_defense_pass_rating",
+            "home_defense_rush_rating",
+            "home_pace_seconds_per_play",
+            "home_offense_epa",
+            "home_defense_epa",
+            "home_offense_success_rate",
+            "home_defense_success_rate",
+            "home_travel_penalty",
+            "home_rest_penalty",
+            "home_weather_adjustment",
+            "home_timezone_diff_hours",
+            "home_points_for_avg",
+            "home_points_against_avg",
+            "home_point_diff_avg",
+            "home_win_pct_recent",
+            "home_prev_points_for",
+            "home_prev_points_against",
+            "home_prev_point_diff",
+            "home_rest_days",
+            "away_offense_pass_rating",
+            "away_offense_rush_rating",
+            "away_defense_pass_rating",
+            "away_defense_rush_rating",
+            "away_pace_seconds_per_play",
+            "away_offense_epa",
+            "away_defense_epa",
+            "away_offense_success_rate",
+            "away_defense_success_rate",
+            "away_travel_penalty",
+            "away_rest_penalty",
+            "away_weather_adjustment",
+            "away_timezone_diff_hours",
+            "away_points_for_avg",
+            "away_points_against_avg",
+            "away_point_diff_avg",
+            "away_win_pct_recent",
+            "away_prev_points_for",
+            "away_prev_points_against",
+            "away_prev_point_diff",
+            "away_rest_days",
+        ]
+
+        injury_columns = [
+            col
+            for col in df.columns
+            if col.startswith("home_injury_") or col.startswith("away_injury_")
+        ]
+        numeric_features.extend(sorted(injury_columns))
+
+        categorical_features = [
+            "venue",
+            "day_of_week",
+            "referee",
+            "weather_conditions",
+            "home_team",
+            "away_team",
+        ]
+
+        available_numeric = [
+            col for col in numeric_features if col in df.columns and df[col].notna().any()
+        ]
+        dropped_numeric = sorted(set(numeric_features) - set(available_numeric))
+        if dropped_numeric:
+            logging.debug(
+                "Dropping numeric game features with no observed values: %s",
+                ", ".join(dropped_numeric),
+            )
+
+        available_categorical = [
+            col for col in categorical_features if col in df.columns and df[col].notna().any()
+        ]
+        dropped_categorical = sorted(set(categorical_features) - set(available_categorical))
+        if dropped_categorical:
+            logging.debug(
+                "Dropping categorical game features with no observed values: %s",
+                ", ".join(dropped_categorical),
+            )
+
+        if not available_numeric and not available_categorical:
+            logging.warning(
+                "No usable features with observed values available to train game-level models.",
+            )
+            return {}
+
+        feature_columns = available_numeric + available_categorical
+
+        train_df, test_df, sorted_df = self._chronological_split(df)
+        X_train = train_df[feature_columns]
+        X_test = test_df[feature_columns]
+
+        y_winner_train = (train_df["game_result"] == "home").astype(int)
+        y_winner_test = (test_df["game_result"] == "home").astype(int)
+
+        y_home_train = train_df["home_score"]
+        y_home_test = test_df["home_score"]
+
+        y_away_train = train_df["away_score"]
+        y_away_test = test_df["away_score"]
+
+        transformers = []
+        if available_numeric:
+            transformers.append(
+                (
+                    "num",
+                    Pipeline([("imputer", SimpleImputer()), ("scaler", StandardScaler())]),
+                    available_numeric,
+                )
+            )
+        if available_categorical:
+            transformers.append(
+                (
+                    "cat",
+                    Pipeline(
+                        [
+                            (
+                                "imputer",
+                                SimpleImputer(strategy="constant", fill_value="missing"),
+                            ),
+                            ("onehot", OneHotEncoder(handle_unknown="ignore")),
+                        ]
+                    ),
+                    available_categorical,
+                )
+            )
+
+        preprocessor = ColumnTransformer(transformers=transformers)
+
+        baseline_clf = Pipeline(
+            [
+                ("preprocessor", clone(preprocessor)),
+                ("classifier", GradientBoostingClassifier(random_state=42)),
+            ]
+        )
+        baseline_home = Pipeline(
+            [
+                ("preprocessor", clone(preprocessor)),
+                ("regressor", GradientBoostingRegressor(random_state=42)),
+            ]
+        )
+        baseline_away = Pipeline(
+            [
+                ("preprocessor", clone(preprocessor)),
+                ("regressor", GradientBoostingRegressor(random_state=42)),
+            ]
+        )
+
+        baseline_clf.fit(X_train, y_winner_train)
+        baseline_home.fit(X_train, y_home_train)
+        baseline_away.fit(X_train, y_away_train)
+
+        logging.info(
+            "Trained game outcome classifier (baseline), accuracy=%.3f",
+            baseline_clf.score(X_test, y_winner_test),
+        )
+        logging.info(
+            "Trained home score regressor (baseline), R^2=%.3f",
+            baseline_home.score(X_test, y_home_test),
+        )
+        logging.info(
+            "Trained away score regressor (baseline), R^2=%.3f",
+            baseline_away.score(X_test, y_away_test),
+        )
+
+        tuned_clf = Pipeline(
+            [
+                ("preprocessor", clone(preprocessor)),
+                ("classifier", GradientBoostingClassifier(random_state=42)),
+            ]
+        )
+        tuned_home = Pipeline(
+            [
+                ("preprocessor", clone(preprocessor)),
+                ("regressor", GradientBoostingRegressor(random_state=42)),
+            ]
+        )
+        tuned_away = Pipeline(
+            [
+                ("preprocessor", clone(preprocessor)),
+                ("regressor", GradientBoostingRegressor(random_state=42)),
+            ]
+        )
+
+        try:
+            cv = self._build_time_series_cv(len(X_train))
+        except ValueError as exc:
+            logging.warning(
+                "Skipping hyperparameter tuning for game models due to insufficient data: %s",
+                exc,
+            )
+            best_clf = tuned_clf.fit(X_train, y_winner_train)
+            best_reg_home = tuned_home.fit(X_train, y_home_train)
+            best_reg_away = tuned_away.fit(X_train, y_away_train)
+        else:
+            clf_search = RandomizedSearchCV(
+                estimator=tuned_clf,
+                param_distributions=self._gb_param_grid("classifier__"),
+                n_iter=10,
+                scoring="roc_auc",
+                cv=cv,
+                random_state=42,
+                n_jobs=-1,
+            )
+            clf_search.fit(X_train, y_winner_train)
+            best_clf = clf_search.best_estimator_
+            logging.info(
+                "Best parameters for game winner model: %s (CV ROC-AUC=%.3f)",
+                clf_search.best_params_,
+                clf_search.best_score_,
+            )
+
+            home_search = RandomizedSearchCV(
+                estimator=tuned_home,
+                param_distributions=self._gb_param_grid("regressor__"),
+                n_iter=10,
+                scoring="neg_mean_absolute_error",
+                cv=cv,
+                random_state=42,
+                n_jobs=-1,
+            )
+            home_search.fit(X_train, y_home_train)
+            best_reg_home = home_search.best_estimator_
+            logging.info(
+                "Best parameters for home score model: %s (CV MAE=%.3f)",
+                home_search.best_params_,
+                -home_search.best_score_,
+            )
+
+            away_search = RandomizedSearchCV(
+                estimator=tuned_away,
+                param_distributions=self._gb_param_grid("regressor__"),
+                n_iter=10,
+                scoring="neg_mean_absolute_error",
+                cv=cv,
+                random_state=42,
+                n_jobs=-1,
+            )
+            away_search.fit(X_train, y_away_train)
+            best_reg_away = away_search.best_estimator_
+            logging.info(
+                "Best parameters for away score model: %s (CV MAE=%.3f)",
+                away_search.best_params_,
+                -away_search.best_score_,
+            )
+
+        rf_clf = Pipeline(
+            [
+                ("preprocessor", clone(preprocessor)),
+                (
+                    "classifier",
+                    RandomForestClassifier(
+                        n_estimators=500,
+                        random_state=42,
+                        min_samples_leaf=2,
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        )
+
+        stack_clf = StackingClassifier(
+            estimators=[("gbm", clone(best_clf)), ("rf", rf_clf)],
+            final_estimator=LogisticRegression(max_iter=1000),
+            passthrough=False,
+            n_jobs=-1,
+        )
+
+        try:
+            calibrated_clf: Pipeline = CalibratedClassifierCV(
+                base_estimator=stack_clf,
+                method="sigmoid",
+                cv=min(3, max(2, len(np.unique(y_winner_train)))),
+            )
+            calibrated_clf.fit(X_train, y_winner_train)
+            final_clf: Pipeline = calibrated_clf
+        except ValueError as exc:
+            logging.warning("Calibration skipped for game winner model: %s", exc)
+            final_clf = stack_clf.fit(X_train, y_winner_train)
+
+        rf_home = Pipeline(
+            [
+                ("preprocessor", clone(preprocessor)),
+                (
+                    "regressor",
+                    RandomForestRegressor(
+                        n_estimators=600,
+                        random_state=42,
+                        min_samples_leaf=2,
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        )
+        final_home = StackingRegressor(
+            estimators=[("gbm", clone(best_reg_home)), ("rf", rf_home)],
+            final_estimator=GradientBoostingRegressor(
+                random_state=42, learning_rate=0.05, max_depth=3, n_estimators=200
+            ),
+            passthrough=False,
+            n_jobs=-1,
+        )
+        final_home.fit(X_train, y_home_train)
+
+        rf_away = Pipeline(
+            [
+                ("preprocessor", clone(preprocessor)),
+                (
+                    "regressor",
+                    RandomForestRegressor(
+                        n_estimators=600,
+                        random_state=42,
+                        min_samples_leaf=2,
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        )
+        final_away = StackingRegressor(
+            estimators=[("gbm", clone(best_reg_away)), ("rf", rf_away)],
+            final_estimator=GradientBoostingRegressor(
+                random_state=42, learning_rate=0.05, max_depth=3, n_estimators=200
+            ),
+            passthrough=False,
+            n_jobs=-1,
+        )
+        final_away.fit(X_train, y_away_train)
+
+        if hasattr(final_clf, "predict_proba"):
+            winner_proba = final_clf.predict_proba(X_test)[:, 1]
+        else:
+            decision = final_clf.decision_function(X_test)
+            winner_proba = 1.0 / (1.0 + np.exp(-decision))
+        winner_pred = (winner_proba >= 0.5).astype(int)
+        winner_accuracy = accuracy_score(y_winner_test, winner_pred)
+        try:
+            winner_roc_auc = roc_auc_score(y_winner_test, winner_proba)
+        except ValueError:
+            winner_roc_auc = float("nan")
+        try:
+            winner_log_loss = log_loss(y_winner_test, winner_proba, labels=[0, 1])
+        except ValueError:
+            winner_log_loss = float("nan")
+        try:
+            winner_brier = brier_score_loss(y_winner_test, winner_proba)
+        except ValueError:
+            winner_brier = float("nan")
+
+        logging.info(
+            "Game winner holdout metrics | accuracy=%.3f | ROC-AUC=%s | log_loss=%s | brier=%s",
+            winner_accuracy,
+            f"{winner_roc_auc:.3f}" if not np.isnan(winner_roc_auc) else "nan",
+            f"{winner_log_loss:.3f}" if not np.isnan(winner_log_loss) else "nan",
+            f"{winner_brier:.3f}" if not np.isnan(winner_brier) else "nan",
+        )
+
+        home_pred = final_home.predict(X_test)
+        home_r2 = final_home.score(X_test, y_home_test)
+        home_mae = mean_absolute_error(y_home_test, home_pred)
+        home_rmse = float(np.sqrt(mean_squared_error(y_home_test, home_pred)))
+        logging.info(
+            "Home score holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
+            home_r2,
+            home_mae,
+            home_rmse,
+        )
+
+        away_pred = final_away.predict(X_test)
+        away_r2 = final_away.score(X_test, y_away_test)
+        away_mae = mean_absolute_error(y_away_test, away_pred)
+        away_rmse = float(np.sqrt(mean_squared_error(y_away_test, away_pred)))
+        logging.info(
+            "Away score holdout metrics | R^2=%.3f | MAE=%.3f | RMSE=%.3f",
+            away_r2,
+            away_mae,
+            away_rmse,
+        )
+
+        self.db.record_backtest_metrics(
+            self.run_id,
+            "game_winner",
+            {
+                "accuracy": winner_accuracy,
+                "roc_auc": winner_roc_auc,
+                "log_loss": winner_log_loss,
+                "brier": winner_brier,
+            },
+            sample_size=len(y_winner_test),
+        )
+        self.db.record_backtest_metrics(
+            self.run_id,
+            "home_points",
+            {"r2": home_r2, "mae": home_mae, "rmse": home_rmse},
+            sample_size=len(y_home_test),
+        )
+        self.db.record_backtest_metrics(
+            self.run_id,
+            "away_points",
+            {"r2": away_r2, "mae": away_mae, "rmse": away_rmse},
+            sample_size=len(y_away_test),
+        )
+
+        self.model_uncertainty["game_winner"] = {
+            "log_loss": winner_log_loss,
+            "brier": winner_brier,
+            "accuracy": winner_accuracy,
+        }
+        self.model_uncertainty["home_points"] = {"rmse": home_rmse, "mae": home_mae}
+        self.model_uncertainty["away_points"] = {"rmse": away_rmse, "mae": away_mae}
+
+        X_full = sorted_df[feature_columns]
+        y_winner_full = (sorted_df["game_result"] == "home").astype(int)
+        final_clf.fit(X_full, y_winner_full)
+        final_home.fit(X_full, sorted_df["home_score"])
+        final_away.fit(X_full, sorted_df["away_score"])
+
+        setattr(final_clf, "feature_columns", feature_columns)
+        setattr(final_home, "feature_columns", feature_columns)
+        setattr(final_away, "feature_columns", feature_columns)
+
+        return {
+            "game_winner": final_clf,
+            "home_points": final_home,
+            "away_points": final_away,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Prediction utilities
+# ---------------------------------------------------------------------------
+
+
+def predict_upcoming_games(
+    models: Dict[str, Pipeline],
+    engine: Engine,
+    model_uncertainty: Optional[Dict[str, Dict[str, float]]] = None,
+    output_path: Optional[Path] = None,
+    save_json: bool = False,
+) -> Dict[str, pd.DataFrame]:
+    feature_builder = FeatureBuilder(engine)
+    feature_builder.build_features()
+    model_uncertainty = model_uncertainty or {}
+
+    base_games = pd.read_sql_table("nfl_games", engine).rename(columns=lambda col: str(col))
+    base_games["start_time"] = pd.to_datetime(base_games["start_time"])
+    base_games["day_of_week"] = base_games["day_of_week"].where(
+        base_games["day_of_week"].notna(), base_games["start_time"].dt.day_name()
+    )
+
+    games_source = feature_builder.games_frame
+    if games_source is not None and not games_source.empty:
+        games_source = games_source.copy()
+        games_source = games_source.rename(columns=lambda col: str(col))
+    else:
+        games_source = base_games
+
+    games_source["start_time"] = pd.to_datetime(games_source["start_time"])
+    games_source["day_of_week"] = games_source["day_of_week"].where(
+        games_source["day_of_week"].notna(), games_source["start_time"].dt.day_name()
+    )
+
+    if "odds_updated" not in games_source.columns:
+        games_source["odds_updated"] = pd.NaT
+
+    upcoming_mask = (games_source["status"].isin(["upcoming", "scheduled", "inprogress"])) | games_source["home_score"].isna()
+    upcoming = games_source.loc[upcoming_mask].copy()
+    if upcoming.empty:
+        logging.warning("No upcoming games found for prediction")
+        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+
+    upcoming["home_team"] = upcoming["home_team"].apply(normalize_team_abbr)
+    upcoming["away_team"] = upcoming["away_team"].apply(normalize_team_abbr)
+    upcoming = upcoming[upcoming["home_team"].notna() & upcoming["away_team"].notna()]
+    if upcoming.empty:
+        logging.warning("Upcoming games are missing team assignments after normalization")
+        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+
+    upcoming["start_time"] = pd.to_datetime(upcoming["start_time"], utc=True, errors="coerce")
+    upcoming = upcoming[upcoming["start_time"].notna()]
+    if upcoming.empty:
+        logging.warning("Upcoming games are missing valid start times after normalization")
+        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+
+    eastern = ZoneInfo("America/New_York")
+    upcoming["local_start_time"] = upcoming["start_time"].dt.tz_convert(eastern)
+    upcoming["local_day_of_week"] = upcoming["local_start_time"].dt.day_name()
+    upcoming["day_of_week"] = upcoming["day_of_week"].where(
+        upcoming["day_of_week"].notna(), upcoming["local_day_of_week"]
+    )
+
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    lookback = now_utc - pd.Timedelta(hours=12)
+    lookahead = now_utc + pd.Timedelta(days=7, hours=12)
+    in_window_mask = (upcoming["start_time"] >= lookback) & (
+        upcoming["start_time"] <= lookahead
+    )
+    window_games = upcoming.loc[in_window_mask].copy()
+
+    if window_games.empty:
+        earliest_start = upcoming["start_time"].min()
+        if pd.isna(earliest_start):
+            logging.warning("No upcoming games have a valid kickoff time available")
+            return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+        week_start = earliest_start.normalize() - pd.to_timedelta(earliest_start.weekday(), unit="D")
+        week_end = week_start + pd.Timedelta(days=7)
+        week_mask = (upcoming["start_time"] >= week_start) & (
+            upcoming["start_time"] <= week_end
+        )
+        window_games = upcoming.loc[week_mask].copy()
+        if window_games.empty:
+            logging.warning("No upcoming games within the current week window")
+            return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+        logging.info(
+            "Falling back to earliest scheduled week %s-%s with %d games",
+            week_start.date(),
+            week_end.date(),
+            len(window_games),
+        )
+
+    upcoming = window_games.copy()
+
+    desired_days = {"Thursday", "Sunday", "Monday"}
+    upcoming = upcoming[upcoming["local_day_of_week"].isin(desired_days)]
+    if upcoming.empty:
+        logging.warning("No Thursday/Sunday/Monday games available for prediction")
+        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+
+    upcoming.loc[:, "_priority"] = upcoming["game_id"].apply(
+        lambda value: 0 if isinstance(value, str) and value.isdigit() else 1
+    )
+    upcoming = upcoming.sort_values(
+        ["_priority", "odds_updated", "start_time"], ascending=[True, False, True]
+    )
+    upcoming = upcoming.drop_duplicates(
+        subset=["home_team", "away_team", "start_time"], keep="first"
+    )
+    upcoming = upcoming.drop(columns="_priority", errors="ignore")
+
+    upcoming = upcoming.sort_values("start_time").reset_index(drop=True)
+
+    def _ensure_model_features(frame: pd.DataFrame, model: Pipeline) -> pd.DataFrame:
+        columns = getattr(model, "feature_columns", None)
+        if not columns:
+            return frame
+        missing = [col for col in columns if col not in frame.columns]
+        if missing:
+            frame = frame.copy()
+            for col in missing:
+                frame[col] = np.nan
+        return frame[columns]
+
+    # Game-level predictions
+    game_models_present = all(key in models for key in ("game_winner", "home_points", "away_points"))
+    if not game_models_present:
+        logging.error("Missing trained game-level models. Cannot generate scoreboard predictions.")
+        return {"games": pd.DataFrame(), "players": pd.DataFrame()}
+
+    game_features = feature_builder.prepare_upcoming_game_features(upcoming)
+    home_features = _ensure_model_features(game_features, models["home_points"])
+    away_features = _ensure_model_features(game_features, models["away_points"])
+    winner_features = _ensure_model_features(game_features, models["game_winner"])
+
+    away_predictions = models["away_points"].predict(away_features)
+    home_predictions = models["home_points"].predict(home_features)
+    winner_probs = models["game_winner"].predict_proba(winner_features)[:, 1]
+
+    scoreboard = upcoming[[
+        "game_id",
+        "start_time",
+        "local_start_time",
+        "away_team",
+        "home_team",
+    ]].copy()
+    scoreboard["away_score"] = away_predictions
+    scoreboard["home_score"] = home_predictions
+    scoreboard["home_win_probability"] = winner_probs
+
+    home_unc = (model_uncertainty.get("home_points") or {})
+    away_unc = (model_uncertainty.get("away_points") or {})
+    winner_unc = (model_uncertainty.get("game_winner") or {})
+
+    home_rmse = float(home_unc.get("rmse")) if home_unc.get("rmse") is not None else np.nan
+    away_rmse = float(away_unc.get("rmse")) if away_unc.get("rmse") is not None else np.nan
+
+    def _interval_bounds(series: pd.Series, rmse: float) -> Tuple[pd.Series, pd.Series]:
+        if pd.isna(rmse):
+            return pd.Series(np.nan, index=series.index), pd.Series(np.nan, index=series.index)
+        lower = series - rmse
+        upper = series + rmse
+        return lower.clip(lower=0.0), upper.clip(lower=0.0)
+
+    home_lower, home_upper = _interval_bounds(scoreboard["home_score"], home_rmse)
+    away_lower, away_upper = _interval_bounds(scoreboard["away_score"], away_rmse)
+    scoreboard["home_score_lower"] = home_lower
+    scoreboard["home_score_upper"] = home_upper
+    scoreboard["away_score_lower"] = away_lower
+    scoreboard["away_score_upper"] = away_upper
+
+    scoreboard["home_win_log_loss"] = winner_unc.get("log_loss")
+    scoreboard["home_win_brier"] = winner_unc.get("brier")
+    scoreboard["home_win_accuracy"] = winner_unc.get("accuracy")
+    scoreboard["date"] = scoreboard["local_start_time"].dt.date.astype(str)
+    scoreboard = scoreboard[
+        [
+            "game_id",
+            "date",
+            "start_time",
+            "local_start_time",
+            "away_team",
+            "home_team",
+            "away_score",
+            "home_score",
+            "away_score_lower",
+            "away_score_upper",
+            "home_score_lower",
+            "home_score_upper",
+            "home_win_probability",
+            "home_win_log_loss",
+            "home_win_brier",
+            "home_win_accuracy",
+        ]
+    ].rename(
+        columns={
+            "away_team": "away_team_abbr",
+            "home_team": "home_team_abbr",
+        }
+    )
+    scoreboard = scoreboard.sort_values(["date", "start_time", "game_id"]).reset_index(drop=True)
+
+    # Player-level predictions
+    player_features = feature_builder.prepare_upcoming_player_features(upcoming)
+    player_predictions = pd.DataFrame()
+    if not player_features.empty:
+        player_predictions = player_features[
+            ["game_id", "team", "player_id", "player_name", "position"]
+        ].copy()
+
+        for target, model in models.items():
+            if target in {"game_winner", "home_points", "away_points"}:
+                continue
+            features_for_model = _ensure_model_features(player_features, model)
+            try:
+                preds = model.predict(features_for_model)
+            except Exception:
+                logging.exception("Failed to generate predictions for %s", target)
+                continue
+            player_predictions[f"pred_{target}"] = preds
+
+        for column in [
+            "pred_rushing_yards",
+            "pred_receiving_yards",
+            "pred_receptions",
+            "pred_rushing_tds",
+            "pred_receiving_tds",
+            "pred_passing_tds",
+        ]:
+            if column not in player_predictions.columns:
+                player_predictions[column] = np.nan
+
+        value_columns = [
+            "pred_rushing_yards",
+            "pred_receiving_yards",
+            "pred_receptions",
+            "pred_rushing_tds",
+            "pred_receiving_tds",
+            "pred_passing_tds",
+        ]
+        player_predictions[value_columns] = player_predictions[value_columns].fillna(0.0)
+
+        player_predictions["pred_touchdowns"] = (
+            player_predictions["pred_rushing_tds"].fillna(0)
+            + player_predictions["pred_receiving_tds"].fillna(0)
+            + player_predictions["pred_passing_tds"].fillna(0)
+        )
+
+    # Reporting output
+    lines: List[str] = []
+    lines.append(
+        "date, away_team_abbr, home_team_abbr, away_score (±RMSE), home_score (±RMSE)"
+    )
+    for row in scoreboard.itertuples(index=False):
+        away_low = row.away_score_lower if not pd.isna(row.away_score_lower) else row.away_score
+        away_high = row.away_score_upper if not pd.isna(row.away_score_upper) else row.away_score
+        home_low = row.home_score_lower if not pd.isna(row.home_score_lower) else row.home_score
+        home_high = row.home_score_upper if not pd.isna(row.home_score_upper) else row.home_score
+        lines.append(
+            f"{row.date}, {row.away_team_abbr}, {row.home_team_abbr}, "
+            f"{row.away_score:.2f} ({away_low:.2f}-{away_high:.2f}), "
+            f"{row.home_score:.2f} ({home_low:.2f}-{home_high:.2f})"
+        )
+
+    if winner_unc:
+        lines.append("")
+        lines.append("Game winner calibration:")
+        if winner_unc.get("log_loss") is not None:
+            lines.append(f"  Log loss: {winner_unc['log_loss']:.3f}")
+        if winner_unc.get("brier") is not None:
+            lines.append(f"  Brier score: {winner_unc['brier']:.3f}")
+        if winner_unc.get("accuracy") is not None:
+            lines.append(f"  Validation accuracy: {winner_unc['accuracy']:.3f}")
+
+    position_order = {"QB": 0, "RB": 1, "HB": 1, "FB": 1, "WR": 2, "TE": 3}
+
+    if not player_predictions.empty:
+        for game in scoreboard.itertuples(index=False):
+            lines.append("")
+            lines.append(f"{game.away_team_abbr} vs {game.home_team_abbr}")
+            lines.append("----------")
+            lines.append(
+                "Player Name, Rushing Yards, Receiving Yards, Receptions, Touchdowns, Passing Touchdowns"
+            )
+            lines.append("=" * 88)
+
+            game_players = player_predictions[player_predictions["game_id"] == game.game_id]
+            for team in [game.away_team_abbr, game.home_team_abbr]:
+                team_players = game_players[game_players["team"] == team]
+                team_players = team_players.copy()
+                team_players["_pos_order"] = team_players["position"].map(position_order).fillna(9)
+                team_players = team_players.sort_values(
+                    ["_pos_order", "pred_touchdowns", "pred_receptions"], ascending=[True, False, False]
+                )
+                for player in team_players.itertuples(index=False):
+                    name = player.player_name or "Unknown Player"
+                    lines.append(
+                        f"{name} ({team} {player.position}), "
+                        f"{player.pred_rushing_yards:.2f}, "
+                        f"{player.pred_receiving_yards:.2f}, "
+                        f"{player.pred_receptions:.2f}, "
+                        f"{player.pred_touchdowns:.2f}, "
+                        f"{player.pred_passing_tds:.2f}"
+                    )
+
+    report_text = "\n".join(lines)
+    print(report_text)
+
+    if save_json and output_path is not None:
+        games_payload = scoreboard.copy()
+        games_payload["start_time"] = games_payload["start_time"].astype(str)
+        if "local_start_time" in games_payload.columns:
+            games_payload["local_start_time"] = games_payload["local_start_time"].astype(str)
+
+        players_payload = player_predictions.drop(
+            columns=[col for col in player_predictions.columns if col.startswith("_")],
+            errors="ignore",
+        )
+        if "start_time" in players_payload.columns:
+            players_payload["start_time"] = players_payload["start_time"].astype(str)
+        if "local_start_time" in players_payload.columns:
+            players_payload["local_start_time"] = players_payload["local_start_time"].astype(str)
+
+        output_payload = {
+            "games": games_payload.to_dict(orient="records"),
+            "players": players_payload.to_dict(orient="records"),
+        }
+        output_path.write_text(json.dumps(output_payload, indent=2))
+        logging.info("Saved prediction summary to %s", output_path)
+
+    return {"games": scoreboard, "players": player_predictions}
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+
+def setup_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)8s | %(name)s | %(message)s",
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="NFL betting analytics pipeline")
+    parser.add_argument("--config", type=str, help="Optional path to JSON config file")
+    parser.add_argument("--predict", action="store_true", help="Generate predictions for upcoming games")
+    parser.add_argument("--output", type=Path, default=Path("predictions.json"), help="Where to save predictions")
+    return parser.parse_args()
+
+
+def load_config(path: Optional[str]) -> NFLConfig:
+    config = NFLConfig()
+    if not path:
+        return config
+
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    for field in dataclasses.fields(config):
+        if field.name in payload:
+            setattr(config, field.name, payload[field.name])
+    return config
+
+
+def main() -> None:
+    args = parse_args()
+    config = load_config(args.config)
+    setup_logging(config.log_level)
+
+    logging.info("Connecting to PostgreSQL at %s", config.pg_url)
+    engine = create_engine(config.pg_url, future=True)
+    db = NFLDatabase(engine)
+
+    msf_client = MySportsFeedsClient(NFL_API_USER, NFL_API_PASS)
+    odds_client = OddsApiClient(ODDS_API_KEY)
+
+    ingestor = NFLIngestor(db, msf_client, odds_client)
+    ingestor.ingest(config.seasons)
+
+    trainer = ModelTrainer(engine, db)
+    try:
+        models = trainer.train()
+    except RuntimeError as exc:
+        logging.error("Unable to train models: %s", exc)
+        logging.error(
+            "Model training requires historical games and player statistics. "
+            "Ensure ingestion succeeded (check API credentials, plan access, and season settings) before rerunning."
+        )
+        if args.predict:
+            logging.error("Prediction generation skipped because models were not trained.")
+        return
+
+    if not models:
+        logging.warning(
+            "No models were trained. Verify that sufficient labeled data exists in the database before requesting predictions."
+        )
+        if args.predict:
+            logging.error("Prediction generation skipped because no models were available.")
+        return
+
+    predict_upcoming_games(
+        models,
+        engine,
+        trainer.model_uncertainty,
+        output_path=args.output if args.predict else None,
+        save_json=args.predict,
+    )
+
+
+if __name__ == "__main__":
+    main()
