@@ -1279,6 +1279,17 @@ class ModelTrainer:
             n_splits = n_samples - 1
         return TimeSeriesSplit(n_splits=n_splits)
 
+    @staticmethod
+    def _gb_param_grid(prefix: str) -> Dict[str, List[Any]]:
+        """Gradient boosting hyperparameter search space helper."""
+
+        return {
+            f"{prefix}learning_rate": [0.01, 0.05, 0.1, 0.2],
+            f"{prefix}n_estimators": [100, 200, 300, 400],
+            f"{prefix}max_depth": [2, 3, 4],
+            f"{prefix}subsample": [0.6, 0.8, 1.0],
+        }
+
     def train(self) -> Dict[str, Pipeline]:
         datasets = self.feature_builder.build_features()
         models: Dict[str, Pipeline] = {}
@@ -1603,6 +1614,7 @@ class ModelTrainer:
         best_clf = clf
         best_reg_home = reg_home
         best_reg_away = reg_away
+
         try:
             cv = self._build_time_series_cv(len(X_train))
         except ValueError as exc:
