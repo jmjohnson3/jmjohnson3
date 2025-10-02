@@ -75,6 +75,19 @@ NFL_SPORT_KEY = "americanfootball_nfl"
 ODDS_REGIONS = ["us"]
 ODDS_FORMAT = "american"
 
+# Shared categorical weather-related feature candidates. Only the columns
+# present in a given dataset will be used downstream.
+WEATHER_CATEGORICAL_FEATURES = [
+    "weather_conditions",
+    "is_precip",
+    "is_windy",
+    "has_precip",
+    "has_precipitation",
+    "has_wind",
+    "precip_flag",
+    "wind_flag",
+]
+
 DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # ---------------------------------------------------------------------------
@@ -845,7 +858,7 @@ class FeatureBuilder:
             )
             team_strength = self._compute_team_unit_strength(player_stats)
         else:
-            enrichment_columns = [
+            base_enrichment_columns = [
                 "game_id",
                 "season",
                 "week",
@@ -855,11 +868,16 @@ class FeatureBuilder:
                 "state",
                 "day_of_week",
                 "referee",
-                "weather_conditions",
                 "temperature_f",
                 "home_team",
                 "away_team",
             ]
+            enrichment_columns = [
+                col for col in base_enrichment_columns if col in games.columns
+            ]
+            for col in WEATHER_CATEGORICAL_FEATURES:
+                if col in games.columns and col not in enrichment_columns:
+                    enrichment_columns.append(col)
             player_stats = player_stats.merge(
                 games[enrichment_columns],
                 on="game_id",
@@ -1364,7 +1382,7 @@ class ModelTrainer:
             "day_of_week",
             "referee",
             "position",
-        ]
+        ] + WEATHER_CATEGORICAL_FEATURES
 
         available_numeric = [
             col for col in numeric_features if col in df.columns and df[col].notna().any()
@@ -1538,7 +1556,13 @@ class ModelTrainer:
             "away_prev_point_diff",
             "away_rest_days",
         ]
-        categorical_features = ["venue", "day_of_week", "referee", "home_team", "away_team"]
+        categorical_features = [
+            "venue",
+            "day_of_week",
+            "referee",
+            "home_team",
+            "away_team",
+        ] + WEATHER_CATEGORICAL_FEATURES
 
         available_numeric = [
             col for col in numeric_features if col in df.columns and df[col].notna().any()
@@ -1799,7 +1823,7 @@ def predict_upcoming_games(models: Dict[str, Pipeline], engine: Engine, output_p
     predictions: List[Dict[str, Any]] = []
     for _, row in future_games.iterrows():
         prediction_id_base = f"{row['game_id']}"
-        features = row[[
+        base_feature_cols = [
             "week",
             "temperature_f",
             "home_moneyline",
@@ -1838,7 +1862,14 @@ def predict_upcoming_games(models: Dict[str, Pipeline], engine: Engine, output_p
             "referee",
             "home_team",
             "away_team",
-        ]]
+        ]
+        weather_feature_cols = [
+            col for col in WEATHER_CATEGORICAL_FEATURES if col in future_games.columns
+        ]
+        feature_cols = base_feature_cols + [
+            col for col in weather_feature_cols if col not in base_feature_cols
+        ]
+        features = row[feature_cols]
 
         winner_prob = models["game_winner"].predict_proba(pd.DataFrame([features]))[0, 1]
         home_points = models["home_points"].predict(pd.DataFrame([features]))[0]
