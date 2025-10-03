@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import re
 import unicodedata
 import uuid
 from pathlib import Path
@@ -348,7 +349,24 @@ INJURY_STATUS_MAP = {
     "physically unable to perform": "out",
     "reserve/covid-19": "out",
     "covid-19": "out",
+    "non-football injury": "out",
+    "pup": "out",
+    "ir": "out",
 }
+
+INJURY_OUT_KEYWORDS = [
+    "injured reserve",
+    "season-ending",
+    "season ending",
+    "out for season",
+    "out indefinitely",
+    "placed on ir",
+    "on ir",
+    "reserve/",
+    "nfi",
+    "pup",
+    "physically unable to perform",
+]
 
 INJURY_STATUS_PRIORITY = {
     "out": -1,
@@ -362,14 +380,50 @@ INJURY_STATUS_PRIORITY = {
 PRACTICE_STATUS_PRIORITY = {
     "full": 3,
     "limited": 2,
-    "lp": 2,
     "dnp": 0,
-    "did not practice": 0,
     "rest": 2,
     "available": 2,
 }
 
+PRACTICE_STATUS_ALIASES = {
+    "fp": "full",
+    "full practice": "full",
+    "full participation": "full",
+    "lp": "limited",
+    "limited practice": "limited",
+    "limited participation": "limited",
+    "did not practice": "dnp",
+    "did not participate": "dnp",
+    "out": "dnp",
+    "no practice": "dnp",
+    "rest": "rest",
+    "not injury related": "rest",
+    "available": "available",
+}
+
 INACTIVE_INJURY_BUCKETS = {"out", "suspended"}
+
+POSITION_ALIAS_MAP = {
+    "HB": "RB",
+    "TB": "RB",
+    "FB": "RB",
+    "SLOT": "WR",
+    "FL": "WR",
+    "SE": "WR",
+    "X": "WR",
+    "Z": "WR",
+    "Y": "TE",
+}
+
+POSITION_PREFIX_MAP = {
+    "QB": "QB",
+    "RB": "RB",
+    "HB": "RB",
+    "FB": "RB",
+    "TB": "RB",
+    "WR": "WR",
+    "TE": "TE",
+}
 
 
 TARGET_ALLOWED_POSITIONS: Dict[str, set[str]] = {
@@ -394,6 +448,78 @@ def normalize_player_name(value: Any) -> str:
     cleaned = [ch for ch in normalized if ch.isalpha() or ch.isspace()]
     collapsed = " ".join("".join(cleaned).lower().split())
     return collapsed
+
+
+def normalize_position(value: Any) -> str:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return ""
+    text = str(value).upper().strip()
+    if not text:
+        return ""
+    text = POSITION_ALIAS_MAP.get(text, text)
+    for prefix, canonical in POSITION_PREFIX_MAP.items():
+        if text.startswith(prefix):
+            return canonical
+    return text
+
+
+def normalize_practice_status(value: Any) -> str:
+    text = str(value or "").lower().strip()
+    if not text:
+        return "available"
+    if re.search(r"\b(ir|injured reserve|pup|nfi|reserve)\b", text):
+        return "dnp"
+    if text in PRACTICE_STATUS_ALIASES:
+        text = PRACTICE_STATUS_ALIASES[text]
+    else:
+        for keyword, canonical in (
+            ("full", "full"),
+            ("limited", "limited"),
+            ("dnp", "dnp"),
+            ("did not practice", "dnp"),
+            ("rest", "rest"),
+        ):
+            if keyword in text:
+                text = canonical
+                break
+    if text not in PRACTICE_STATUS_PRIORITY:
+        return "available"
+    return text
+
+
+def normalize_injury_status(value: Any) -> str:
+    text = str(value or "").lower().strip()
+    if not text:
+        return "other"
+    if text in INJURY_STATUS_MAP:
+        return INJURY_STATUS_MAP[text]
+    if re.search(r"\b(ir|pup|nfi|reserve)\b", text):
+        return "out"
+    if "questionable" in text:
+        return "questionable"
+    if "doubtful" in text:
+        return "doubtful"
+    if "probable" in text:
+        return "probable"
+    if "suspend" in text:
+        return "suspended"
+    for keyword in INJURY_OUT_KEYWORDS:
+        if keyword in text:
+            return "out"
+    return "other"
+
+
+def compute_injury_bucket(status: Any, description: Any = None) -> str:
+    """Derive a canonical availability bucket from status and free-form notes."""
+
+    bucket = normalize_injury_status(status)
+    if bucket != "out":
+        desc_text = str(description or "").lower().strip()
+        for keyword in INJURY_OUT_KEYWORDS:
+            if keyword in desc_text:
+                bucket = "out"
+                break
+    return bucket
 
 
 def parse_depth_rank(value: Any) -> Optional[float]:
@@ -1621,6 +1747,23 @@ class FeatureBuilder:
         injuries = injuries.rename(columns=lambda col: str(col))
         depth_charts = depth_charts.rename(columns=lambda col: str(col))
         advanced_metrics = advanced_metrics.rename(columns=lambda col: str(col))
+        if "position" in player_stats.columns:
+            player_stats["position"] = player_stats["position"].apply(normalize_position)
+        if "practice_status" in player_stats.columns:
+            player_stats["practice_status"] = player_stats["practice_status"].apply(
+                normalize_practice_status
+            )
+        if "position" in depth_charts.columns:
+            depth_charts["position"] = depth_charts["position"].apply(normalize_position)
+        if "practice_status" in injuries.columns:
+            injuries["practice_status_raw"] = injuries["practice_status"]
+            injuries["practice_status"] = injuries["practice_status"].apply(
+                normalize_practice_status
+            )
+        if "status" in injuries.columns:
+            injuries["status_original"] = injuries["status"]
+            injuries["status"] = injuries["status"].apply(normalize_injury_status)
+
         return games, player_stats, team_ratings, injuries, depth_charts, advanced_metrics
 
     def build_features(self) -> Dict[str, pd.DataFrame]:
@@ -1642,6 +1785,9 @@ class FeatureBuilder:
         injuries = injuries.copy()
         depth_charts = depth_charts.copy()
         advanced_metrics = advanced_metrics.copy()
+
+        if "position" in player_stats.columns:
+            player_stats["position"] = player_stats["position"].apply(normalize_position)
         self.games_frame = games
         self.injury_frame = injuries
         self.depth_chart_frame = depth_charts
@@ -1660,13 +1806,14 @@ class FeatureBuilder:
         if not injuries.empty:
             injuries["team"] = injuries["team"].apply(normalize_team_abbr)
             injuries["player_name_norm"] = injuries["player_name"].apply(normalize_player_name)
-            injuries["status_bucket"] = (
-                injuries["status"]
-                .fillna("")
-                .str.lower()
-                .str.strip()
-                .map(INJURY_STATUS_MAP)
-                .fillna("other")
+            if "status_original" not in injuries.columns:
+                injuries["status_original"] = injuries.get("status")
+            injuries["status_bucket"] = injuries.apply(
+                lambda row: compute_injury_bucket(
+                    row.get("status_original") or row.get("status"),
+                    row.get("description"),
+                ),
+                axis=1,
             )
             injuries["practice_status"] = injuries["practice_status"].fillna("")
             injuries["report_time"] = pd.to_datetime(injuries["report_time"], errors="coerce")
@@ -1882,22 +2029,22 @@ class FeatureBuilder:
             else:
                 player_stats["depth_rank"] = np.nan
 
-            player_stats["status_bucket"] = player_stats["status_bucket"].fillna("other")
-            player_stats["practice_status"] = player_stats["practice_status"].fillna("available")
+            player_stats["status_bucket"] = (
+                player_stats["status_bucket"].fillna("other").apply(normalize_injury_status)
+            )
+            player_stats["practice_status"] = (
+                player_stats["practice_status"].fillna("available").apply(normalize_practice_status)
+            )
             player_stats["injury_priority"] = player_stats["status_bucket"].map(
                 INJURY_STATUS_PRIORITY
             ).fillna(INJURY_STATUS_PRIORITY.get("other", 1))
-            player_stats["practice_priority"] = (
-                player_stats["practice_status"]
-                .astype(str)
-                .str.lower()
-                .str.strip()
-                .map(PRACTICE_STATUS_PRIORITY)
-                .fillna(1)
-            )
+            player_stats["practice_priority"] = player_stats["practice_status"].map(
+                PRACTICE_STATUS_PRIORITY
+            ).fillna(1)
             player_stats["depth_rank"] = pd.to_numeric(
                 player_stats["depth_rank"], errors="coerce"
             )
+            player_stats["depth_rank"] = player_stats["depth_rank"].fillna(99.0)
             player_stats = player_stats.drop(columns=["player_name_norm"], errors="ignore")
 
             def add_dataset(target: str, positions: Iterable[str]) -> None:
@@ -2291,10 +2438,16 @@ class FeatureBuilder:
         )
         latest_players["team"] = latest_players["team"].apply(normalize_team_abbr)
         latest_players = latest_players[latest_players["team"].notna()]
+        if "position" in latest_players.columns:
+            latest_players["position"] = latest_players["position"].apply(
+                normalize_position
+            )
 
         season_source = self.player_feature_frame.copy()
         season_source["team"] = season_source["team"].apply(normalize_team_abbr)
         season_source = season_source[season_source["team"].isin(TEAM_ABBR_CANONICAL.keys())]
+        if "position" in season_source.columns:
+            season_source["position"] = season_source["position"].apply(normalize_position)
 
         if not season_source.empty:
             aggregate_candidates = [
@@ -2336,15 +2489,29 @@ class FeatureBuilder:
                 normalize_player_name
             )
             injuries_latest = injuries_latest[injuries_latest["player_name_norm"] != ""]
-            injuries_latest["status_bucket"] = (
-                injuries_latest["status"]
-                .fillna("")
-                .str.lower()
-                .str.strip()
-                .map(INJURY_STATUS_MAP)
-                .fillna("other")
+
+            if "status_original" not in injuries_latest.columns:
+                injuries_latest["status_original"] = injuries_latest.get("status")
+            injuries_latest["status_bucket"] = injuries_latest.apply(
+                lambda row: compute_injury_bucket(
+                    row.get("status_original") or row.get("status"),
+                    row.get("description"),
+                ),
+                axis=1,
             )
-            injuries_latest["practice_status"] = injuries_latest["practice_status"].fillna("")
+
+            practice_source = injuries_latest.get("practice_status_raw")
+            if practice_source is None:
+                practice_source = injuries_latest.get("practice_status")
+            if practice_source is None:
+                practice_source = pd.Series("", index=injuries_latest.index)
+            injuries_latest["_has_practice_report"] = (
+                practice_source.astype(str).str.strip() != ""
+            )
+            injuries_latest["practice_status"] = practice_source.apply(
+                normalize_practice_status
+            )
+
             injuries_latest["report_time"] = pd.to_datetime(
                 injuries_latest["report_time"], errors="coerce"
             )
@@ -2353,15 +2520,28 @@ class FeatureBuilder:
                 subset=["team", "player_name_norm"], keep="last"
             )
 
+            active_mask = (
+                injuries_latest["_has_practice_report"]
+                & injuries_latest["practice_status"].isin({"full", "available", "rest"})
+            )
+            injuries_latest.loc[
+                active_mask & ~injuries_latest["status_bucket"].isin({"suspended"}),
+                "status_bucket",
+            ] = "other"
+            injuries_latest = injuries_latest.drop(columns=["_has_practice_report"], errors="ignore")
+
         depth_latest = pd.DataFrame()
         if self.depth_chart_frame is not None and not self.depth_chart_frame.empty:
             depth_latest = self.depth_chart_frame.copy()
             depth_latest["team"] = depth_latest["team"].apply(normalize_team_abbr)
-            depth_latest["position"] = depth_latest["position"].astype(str).str.upper().str.strip()
+            depth_latest["position"] = depth_latest["position"].apply(normalize_position)
             depth_latest["player_name_norm"] = depth_latest["player_name"].apply(
                 normalize_player_name
             )
-            depth_latest = depth_latest[depth_latest["player_name_norm"] != ""]
+            depth_latest = depth_latest[
+                (depth_latest["player_name_norm"] != "")
+                & (depth_latest["position"] != "")
+            ]
             depth_latest["updated_at"] = pd.to_datetime(
                 depth_latest["updated_at"], errors="coerce"
             )
@@ -2427,7 +2607,72 @@ class FeatureBuilder:
             missing_cols = set(template_columns) - set(additional_df.columns)
             for col in missing_cols:
                 additional_df[col] = np.nan
-            latest_players = pd.concat([latest_players, additional_df[template_columns]], ignore_index=True, sort=False)
+            latest_players = pd.concat(
+                [latest_players, additional_df[template_columns]],
+                ignore_index=True,
+                sort=False,
+            )
+            existing_keys = set(
+                zip(latest_players["team"], latest_players["player_name_norm"])
+            )
+
+        if not injuries_latest.empty:
+            injury_placeholders: List[Dict[str, Any]] = []
+            for injury_row in injuries_latest.itertuples():
+                key = (injury_row.team, injury_row.player_name_norm)
+                if key in existing_keys:
+                    continue
+                status_bucket = getattr(injury_row, "status_bucket", "other")
+                if status_bucket in INACTIVE_INJURY_BUCKETS:
+                    continue
+                position = normalize_position(getattr(injury_row, "position", ""))
+                if not position:
+                    continue
+                placeholder: Dict[str, Any] = {
+                    col: np.nan
+                    for col in template_columns
+                    if col not in {"player_id", "team", "position"}
+                }
+                placeholder.update(
+                    {
+                        "player_id": f"injury_{injury_row.team}_{injury_row.player_name_norm}",
+                        "player_name": getattr(injury_row, "player_name", ""),
+                        "team": injury_row.team,
+                        "position": position,
+                        "player_name_norm": injury_row.player_name_norm,
+                        "status_bucket": status_bucket,
+                        "practice_status": getattr(
+                            injury_row, "practice_status", "available"
+                        ),
+                    }
+                )
+                season_metric_defaults = {
+                    col: 0.0
+                    for col in template_columns
+                    if col.startswith("season_")
+                }
+                placeholder.update(season_metric_defaults)
+                placeholder.setdefault(
+                    "injury_priority",
+                    INJURY_STATUS_PRIORITY.get(
+                        status_bucket, INJURY_STATUS_PRIORITY.get("other", 1)
+                    ),
+                )
+                injury_placeholders.append(placeholder)
+
+            if injury_placeholders:
+                injury_df = pd.DataFrame(injury_placeholders)
+                missing_cols = set(template_columns) - set(injury_df.columns)
+                for col in missing_cols:
+                    injury_df[col] = np.nan
+                latest_players = pd.concat(
+                    [latest_players, injury_df[template_columns]],
+                    ignore_index=True,
+                    sort=False,
+                )
+                existing_keys = set(
+                    zip(latest_players["team"], latest_players["player_name_norm"])
+                )
 
         if not injuries_latest.empty:
             latest_players = latest_players.merge(
@@ -2453,14 +2698,22 @@ class FeatureBuilder:
         else:
             latest_players["depth_rank"] = latest_players.get("depth_rank", np.nan)
 
-        latest_players["status_bucket"] = latest_players["status_bucket"].fillna("other")
-        latest_players["practice_status"] = latest_players["practice_status"].fillna("available")
+        latest_players["status_bucket"] = (
+            latest_players["status_bucket"].fillna("other").apply(normalize_injury_status)
+        )
+        latest_players["practice_status"] = (
+            latest_players["practice_status"].fillna("available").apply(normalize_practice_status)
+        )
         latest_players["injury_priority"] = latest_players["status_bucket"].map(
             INJURY_STATUS_PRIORITY
         ).fillna(INJURY_STATUS_PRIORITY.get("other", 1))
+        latest_players["practice_priority"] = latest_players["practice_status"].map(
+            PRACTICE_STATUS_PRIORITY
+        ).fillna(1)
         latest_players["depth_rank"] = pd.to_numeric(
             latest_players["depth_rank"], errors="coerce"
         )
+        latest_players["depth_rank"] = latest_players["depth_rank"].fillna(99.0)
 
         games = upcoming_games.copy()
         games["start_time"] = pd.to_datetime(games["start_time"], utc=True, errors="coerce")
@@ -2535,14 +2788,12 @@ class FeatureBuilder:
                             "injury_priority"
                         ].fillna(INJURY_STATUS_PRIORITY.get("other", 1))
 
-                    practice_priority = (
-                        position_candidates["practice_status"]
-                        .astype(str)
-                        .str.lower()
-                        .str.strip()
-                        .map(PRACTICE_STATUS_PRIORITY)
-                        .fillna(1)
-                    )
+                    position_candidates["practice_status"] = position_candidates[
+                        "practice_status"
+                    ].apply(normalize_practice_status)
+                    practice_priority = position_candidates["practice_status"].map(
+                        PRACTICE_STATUS_PRIORITY
+                    ).fillna(1)
                     position_candidates["practice_priority"] = practice_priority
 
                     if pos_key == "QB":
@@ -4199,6 +4450,38 @@ def predict_upcoming_games(
             "pred_passing_tds",
         ]
         player_predictions[value_columns] = player_predictions[value_columns].fillna(0.0)
+
+        qb_mask = player_predictions["position"] == "QB"
+        rb_mask = player_predictions["position"] == "RB"
+        wr_mask = player_predictions["position"] == "WR"
+        te_mask = player_predictions["position"] == "TE"
+
+        # Quarterbacks: retain passing and rushing yardage, suppress receiving metrics
+        player_predictions.loc[qb_mask, [
+            "pred_receiving_yards",
+            "pred_receptions",
+            "pred_receiving_tds",
+            "pred_rushing_tds",
+        ]] = 0.0
+
+        # Rushing output is meaningful for quarterbacks and running backs.
+        rushing_allowed_mask = qb_mask | rb_mask
+        player_predictions.loc[~rushing_allowed_mask, "pred_rushing_yards"] = 0.0
+        player_predictions.loc[~rushing_allowed_mask, "pred_rushing_tds"] = 0.0
+
+        # Pass catchers (RB/WR/TE) retain receiving metrics; others zeroed out
+        receivers_mask = rb_mask | wr_mask | te_mask
+        player_predictions.loc[~receivers_mask, [
+            "pred_receiving_yards",
+            "pred_receptions",
+            "pred_receiving_tds",
+        ]] = 0.0
+
+        # Non-quarterbacks should not have passing output
+        player_predictions.loc[~qb_mask, [
+            "pred_passing_yards",
+            "pred_passing_tds",
+        ]] = 0.0
 
         player_predictions["pred_touchdowns"] = (
             player_predictions["pred_rushing_tds"].fillna(0)
