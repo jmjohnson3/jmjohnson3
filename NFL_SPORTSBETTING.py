@@ -359,7 +359,28 @@ INJURY_STATUS_PRIORITY = {
     "other": 1,
 }
 
+PRACTICE_STATUS_PRIORITY = {
+    "full": 3,
+    "limited": 2,
+    "lp": 2,
+    "dnp": 0,
+    "did not practice": 0,
+    "rest": 2,
+    "available": 2,
+}
+
 INACTIVE_INJURY_BUCKETS = {"out", "suspended"}
+
+
+TARGET_ALLOWED_POSITIONS: Dict[str, set[str]] = {
+    "passing_yards": {"QB"},
+    "passing_tds": {"QB"},
+    "rushing_yards": {"QB", "RB", "HB", "FB"},
+    "rushing_tds": {"RB", "HB", "FB"},
+    "receiving_yards": {"RB", "HB", "FB", "WR", "TE"},
+    "receptions": {"RB", "HB", "FB", "WR", "TE"},
+    "receiving_tds": {"RB", "HB", "FB", "WR", "TE"},
+}
 
 
 def normalize_player_name(value: Any) -> str:
@@ -373,6 +394,49 @@ def normalize_player_name(value: Any) -> str:
     cleaned = [ch for ch in normalized if ch.isalpha() or ch.isspace()]
     collapsed = " ".join("".join(cleaned).lower().split())
     return collapsed
+
+
+def parse_depth_rank(value: Any) -> Optional[float]:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return np.nan
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip().lower()
+    if not text:
+        return np.nan
+
+    alias_map = {
+        "starter": 1,
+        "start": 1,
+        "first": 1,
+        "1st": 1,
+        "qb1": 1,
+        "rb1": 1,
+        "wr1": 1,
+        "te1": 1,
+        "second": 2,
+        "2nd": 2,
+        "qb2": 2,
+        "rb2": 2,
+        "wr2": 2,
+        "third": 3,
+        "3rd": 3,
+        "qb3": 3,
+        "rb3": 3,
+        "wr3": 3,
+    }
+    if text in alias_map:
+        return float(alias_map[text])
+
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if digits:
+        try:
+            return float(int(digits))
+        except ValueError:
+            return np.nan
+
+    return np.nan
 
 
 # ---------------------------------------------------------------------------
@@ -1805,7 +1869,7 @@ class FeatureBuilder:
                     depth_latest["updated_at"], errors="coerce"
                 )
                 depth_latest = depth_latest.sort_values("updated_at")
-                depth_latest["rank"] = pd.to_numeric(depth_latest["rank"], errors="coerce")
+                depth_latest["rank"] = depth_latest["rank"].apply(parse_depth_rank)
                 depth_latest = depth_latest.drop_duplicates(
                     subset=["team", "position", "player_name_norm"], keep="last"
                 )
@@ -1823,6 +1887,14 @@ class FeatureBuilder:
             player_stats["injury_priority"] = player_stats["status_bucket"].map(
                 INJURY_STATUS_PRIORITY
             ).fillna(INJURY_STATUS_PRIORITY.get("other", 1))
+            player_stats["practice_priority"] = (
+                player_stats["practice_status"]
+                .astype(str)
+                .str.lower()
+                .str.strip()
+                .map(PRACTICE_STATUS_PRIORITY)
+                .fillna(1)
+            )
             player_stats["depth_rank"] = pd.to_numeric(
                 player_stats["depth_rank"], errors="coerce"
             )
@@ -1838,13 +1910,21 @@ class FeatureBuilder:
                     return
                 datasets[target] = subset
 
-            add_dataset("rushing_yards", ["RB", "HB", "FB", "QB"])
-            add_dataset("receiving_yards", ["WR", "RB", "HB", "FB", "TE"])
-            add_dataset("receptions", ["WR", "RB", "HB", "FB", "TE"])
-            add_dataset("rushing_tds", ["RB", "HB", "FB", "QB"])
-            add_dataset("receiving_tds", ["WR", "RB", "TE"])
-            add_dataset("passing_yards", ["QB"])
-            add_dataset("passing_tds", ["QB"])
+            ordered_targets = [
+                "passing_yards",
+                "passing_tds",
+                "rushing_yards",
+                "rushing_tds",
+                "receiving_yards",
+                "receptions",
+                "receiving_tds",
+            ]
+
+            for target in ordered_targets:
+                positions = TARGET_ALLOWED_POSITIONS.get(target)
+                if not positions:
+                    continue
+                add_dataset(target, positions)
 
         if self.team_strength_frame is None:
             self.team_strength_frame = team_strength
@@ -2286,7 +2366,7 @@ class FeatureBuilder:
                 depth_latest["updated_at"], errors="coerce"
             )
             depth_latest = depth_latest.sort_values("updated_at")
-            depth_latest["rank"] = pd.to_numeric(depth_latest["rank"], errors="coerce")
+            depth_latest["rank"] = depth_latest["rank"].apply(parse_depth_rank)
             depth_latest = depth_latest.drop_duplicates(
                 subset=["team", "position", "player_name_norm"], keep="last"
             )
@@ -2455,6 +2535,16 @@ class FeatureBuilder:
                             "injury_priority"
                         ].fillna(INJURY_STATUS_PRIORITY.get("other", 1))
 
+                    practice_priority = (
+                        position_candidates["practice_status"]
+                        .astype(str)
+                        .str.lower()
+                        .str.strip()
+                        .map(PRACTICE_STATUS_PRIORITY)
+                        .fillna(1)
+                    )
+                    position_candidates["practice_priority"] = practice_priority
+
                     if pos_key == "QB":
                         sort_cols = [
                             "season_passing_attempts",
@@ -2517,6 +2607,8 @@ class FeatureBuilder:
                         ascending_flags.append(True)
 
                     sort_columns.append("injury_priority")
+                    ascending_flags.append(False)
+                    sort_columns.append("practice_priority")
                     ascending_flags.append(False)
 
                     for col in sort_cols:
@@ -3216,6 +3308,7 @@ class ModelTrainer:
             "away_injury_total",
             "depth_rank",
             "injury_priority",
+            "practice_priority",
         ]
         categorical_features = [
             "team",
@@ -3395,6 +3488,7 @@ class ModelTrainer:
 
         ensemble.fit(sorted_df[feature_columns], sorted_df[target])
         setattr(ensemble, "feature_columns", feature_columns)
+        setattr(ensemble, "allowed_positions", TARGET_ALLOWED_POSITIONS.get(target))
         setattr(ensemble, "target_name", target)
         return ensemble
 
@@ -4061,13 +4155,27 @@ def predict_upcoming_games(
         for target, model in models.items():
             if target in {"game_winner", "home_points", "away_points"}:
                 continue
-            features_for_model = _ensure_model_features(player_features, model)
-            try:
-                preds = model.predict(features_for_model)
-            except Exception:
-                logging.exception("Failed to generate predictions for %s", target)
-                continue
-            player_predictions[f"pred_{target}"] = preds
+
+            allowed_positions = getattr(
+                model, "allowed_positions", TARGET_ALLOWED_POSITIONS.get(target)
+            )
+            if allowed_positions:
+                mask = player_predictions["position"].isin(allowed_positions)
+            else:
+                mask = pd.Series(True, index=player_predictions.index)
+
+            target_values = pd.Series(np.nan, index=player_predictions.index, dtype=float)
+            if mask.any():
+                features_for_model = _ensure_model_features(
+                    player_features.loc[mask], model
+                )
+                try:
+                    preds = model.predict(features_for_model)
+                except Exception:
+                    logging.exception("Failed to generate predictions for %s", target)
+                    continue
+                target_values.loc[mask] = preds
+            player_predictions[f"pred_{target}"] = target_values.values
 
         for column in [
             "pred_passing_yards",
