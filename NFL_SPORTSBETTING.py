@@ -352,6 +352,9 @@ INJURY_STATUS_MAP = {
     "non-football injury": "out",
     "pup": "out",
     "ir": "out",
+    "injury list": "out",
+    "injury_list": "out",
+    "injurylist": "out",
 }
 
 INJURY_OUT_KEYWORDS = [
@@ -366,6 +369,9 @@ INJURY_OUT_KEYWORDS = [
     "nfi",
     "pup",
     "physically unable to perform",
+    "injury list",
+    "injury_list",
+    "injurylist",
 ]
 
 INJURY_STATUS_PRIORITY = {
@@ -399,6 +405,9 @@ PRACTICE_STATUS_ALIASES = {
     "rest": "rest",
     "not injury related": "rest",
     "available": "available",
+    "injury list": "dnp",
+    "injury_list": "dnp",
+    "injurylist": "dnp",
 }
 
 INACTIVE_INJURY_BUCKETS = {"out", "suspended"}
@@ -3018,6 +3027,11 @@ class FeatureBuilder:
         if "depth_rank" not in latest_players.columns:
             latest_players["depth_rank"] = np.nan
 
+        if "status_bucket" not in latest_players.columns:
+            latest_players["status_bucket"] = np.nan
+        if "practice_status" not in latest_players.columns:
+            latest_players["practice_status"] = np.nan
+
         template_columns = latest_players.columns.tolist()
 
         existing_keys: set[Tuple[str, str]] = set(
@@ -3141,10 +3155,34 @@ class FeatureBuilder:
                 ],
                 on=["team", "player_name_norm"],
                 how="left",
+                suffixes=("", "_inj"),
             )
+
+            if "status_bucket_inj" in latest_players.columns:
+                latest_players["status_bucket"] = latest_players[
+                    "status_bucket_inj"
+                ].combine_first(latest_players.get("status_bucket"))
+                latest_players = latest_players.drop(
+                    columns=["status_bucket_inj"], errors="ignore"
+                )
+
+            if "practice_status_inj" in latest_players.columns:
+                latest_players["practice_status"] = latest_players[
+                    "practice_status_inj"
+                ].combine_first(latest_players.get("practice_status"))
+                latest_players = latest_players.drop(
+                    columns=["practice_status_inj"], errors="ignore"
+                )
+
+            if "status_inj" in latest_players.columns and "status" not in latest_players:
+                latest_players = latest_players.rename(
+                    columns={"status_inj": "status"}
+                )
         else:
-            latest_players["status_bucket"] = np.nan
-            latest_players["practice_status"] = np.nan
+            latest_players["status_bucket"] = latest_players.get("status_bucket", np.nan)
+            latest_players["practice_status"] = latest_players.get(
+                "practice_status", np.nan
+            )
 
         if not depth_latest.empty:
             latest_players = latest_players.merge(
