@@ -654,6 +654,11 @@ class SupplementalDataLoader:
             practice_status = record.get("practice_status") or record.get("practice")
             description = record.get("description") or record.get("details")
             report_time = record.get("report_time") or record.get("updated_at")
+            position = normalize_position(
+                record.get("position")
+                or record.get("primary_position")
+                or record.get("pos")
+            )
             normalized_rows.append(
                 {
                     "injury_id": record.get("injury_id")
@@ -666,6 +671,7 @@ class SupplementalDataLoader:
                     "practice_status": practice_status,
                     "description": description,
                     "report_time": parse_dt(report_time) if report_time else None,
+                    "position": position,
                 }
             )
 
@@ -789,19 +795,28 @@ class NFLDatabase:
         except Exception:  # pragma: no cover - defensive fallback if table missing
             game_columns = set()
 
-        alterations: List[str] = []
+        statements: List[str] = []
         if "wind_mph" not in game_columns:
-            alterations.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS wind_mph DOUBLE PRECISION")
+            statements.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS wind_mph DOUBLE PRECISION")
         if "humidity" not in game_columns:
-            alterations.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS humidity DOUBLE PRECISION")
+            statements.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS humidity DOUBLE PRECISION")
         if "injury_summary" not in game_columns:
-            alterations.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS injury_summary TEXT")
+            statements.append("ALTER TABLE nfl_games ADD COLUMN IF NOT EXISTS injury_summary TEXT")
 
-        if not alterations:
+        try:
+            injury_columns = {col["name"] for col in inspector.get_columns("nfl_injury_reports")}
+        except Exception:  # pragma: no cover - table may not exist yet
+            injury_columns = set()
+        if "position" not in injury_columns:
+            statements.append(
+                "ALTER TABLE nfl_injury_reports ADD COLUMN IF NOT EXISTS position TEXT"
+            )
+
+        if not statements:
             return
 
         with self.engine.begin() as conn:
-            for statement in alterations:
+            for statement in statements:
                 conn.execute(text(statement))
 
     def _define_tables(self) -> None:
@@ -897,6 +912,7 @@ class NFLDatabase:
             Column("game_id", String),
             Column("team", String, nullable=False),
             Column("player_name", String),
+            Column("position", String),
             Column("status", String),
             Column("practice_status", String),
             Column("description", String),
@@ -1099,6 +1115,34 @@ class MySportsFeedsClient:
             raise
         return data.get("gamelogs", [])
 
+    def fetch_injuries(
+        self, season: Optional[str] = None, date: Optional[str] = None
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        if season:
+            params["season"] = season
+        if date:
+            params["date"] = date
+        data = self._request("injuries.json", params=params or None)
+        if not isinstance(data, dict):
+            return {"players": [], "lastUpdatedOn": None}
+        data.setdefault("players", [])
+        return data
+
+    def fetch_game_lineup(self, season: str, game_key: str) -> Dict[str, Any]:
+        try:
+            return self._request(f"{season}/games/{game_key}/lineup.json")
+        except HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 404:
+                logging.debug(
+                    "No lineup available for season %s game %s (HTTP 404)",
+                    season,
+                    game_key,
+                )
+                return {}
+            raise
+
 
 class OddsApiClient:
     def __init__(self, api_key: str, timeout: int = 30):
@@ -1149,6 +1193,13 @@ class NFLIngestor:
         games_with_stats = self.db.fetch_games_with_player_stats()
         logging.info("Found %d games already in database", len(existing_games))
 
+        injuries_payload = self.msf_client.fetch_injuries()
+        msf_injuries_last_updated = parse_dt(injuries_payload.get("lastUpdatedOn"))
+        msf_injuries_by_team = self._group_msf_injuries(
+            injuries_payload.get("players", []), msf_injuries_last_updated
+        )
+        lineup_cache: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+
         injury_rows_all: List[Dict[str, Any]] = []
         depth_rows_map: Dict[str, Dict[str, Any]] = {}
         advanced_rows_map: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
@@ -1190,15 +1241,33 @@ class NFLIngestor:
                     or (schedule.get("awayTeam") or {}).get("name")
                 )
 
-                injuries, injury_summary = self.supplemental_loader.injuries_for_game(
+                msf_injuries = self._collect_game_injuries(
+                    game_id_str,
+                    home_team_abbr,
+                    away_team_abbr,
+                    msf_injuries_by_team,
+                )
+                supplemental_injuries, _ = self.supplemental_loader.injuries_for_game(
                     game_id_str, home_team_abbr, away_team_abbr
                 )
+                injuries = self._merge_injury_rows(msf_injuries, supplemental_injuries)
+                injury_summary = self._summarize_injury_rows(injuries)
                 if injuries:
                     injury_rows_all.extend(injuries)
 
                 for team_code in filter(None, {home_team_abbr, away_team_abbr}):
                     for depth_row in self.supplemental_loader.depth_chart_rows(team_code):
                         depth_rows_map[depth_row["depth_id"]] = depth_row
+
+                lineup_rows = self._lineup_rows_from_msf(
+                    season,
+                    start_time,
+                    away_team_abbr,
+                    home_team_abbr,
+                    lineup_cache,
+                )
+                for lineup_row in lineup_rows:
+                    depth_rows_map[lineup_row["depth_id"]] = lineup_row
 
                 week_value = schedule.get("week")
                 try:
@@ -1481,15 +1550,394 @@ class NFLIngestor:
             ["game_id"],
             update_columns=[
                 "start_time",
-            "home_moneyline",
-            "away_moneyline",
-            "home_implied_prob",
-            "away_implied_prob",
-            "odds_updated",
-            "home_team",
-            "away_team",
-        ],
-    )
+                "home_moneyline",
+                "away_moneyline",
+                "home_implied_prob",
+                "away_implied_prob",
+                "odds_updated",
+                "home_team",
+                "away_team",
+            ],
+        )
+
+    def _group_msf_injuries(
+        self,
+        players: List[Dict[str, Any]],
+        last_updated: Optional[dt.datetime],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for entry in players or []:
+            team_info = entry.get("currentTeam") or entry.get("team") or {}
+            team_abbr = normalize_team_abbr(
+                team_info.get("abbreviation") or team_info.get("name")
+            )
+            if not team_abbr:
+                continue
+
+            injury_info = entry.get("currentInjury") or {}
+            roster_status = entry.get("currentRosterStatus") or entry.get("rosterStatus")
+            roster_status_text = str(roster_status or "").strip()
+            roster_status_normalized = roster_status_text.lower()
+            if not injury_info:
+                if roster_status_normalized and (
+                    re.search(r"\b(ir|injured|reserve|pup|nfi)\b", roster_status_normalized)
+                    or any(keyword in roster_status_normalized for keyword in INJURY_OUT_KEYWORDS)
+                ):
+                    injury_info = {
+                        "status": roster_status_text,
+                        "playingProbability": roster_status_text,
+                        "description": roster_status_text,
+                    }
+            if not injury_info:
+                continue
+
+            first = entry.get("firstName", "")
+            last = entry.get("lastName", "")
+            player_name = " ".join(part for part in [first, last] if part).strip()
+            if not player_name:
+                player_name = entry.get("displayName") or ""
+            if not player_name:
+                continue
+
+            position = normalize_position(
+                entry.get("primaryPosition")
+                or entry.get("position")
+                or (injury_info.get("position") if isinstance(injury_info, dict) else None)
+            )
+
+            status = injury_info.get("playingProbability") or injury_info.get("status")
+            practice_status = (
+                injury_info.get("practiceStatus")
+                or injury_info.get("practice")
+                or entry.get("currentPracticeStatus")
+                or roster_status_text
+            )
+            description = injury_info.get("description")
+
+            reported_at: Optional[dt.datetime]
+            updated_raw = injury_info.get("updatedOn") if isinstance(injury_info, dict) else None
+            if updated_raw:
+                reported_at = parse_dt(updated_raw)
+            else:
+                reported_at = last_updated
+
+            grouped.setdefault(team_abbr, []).append(
+                {
+                    "injury_id": f"msf-{entry.get('id') or uuid.uuid4().hex}",
+                    "team": team_abbr,
+                    "player_name": player_name,
+                    "status": status,
+                    "practice_status": practice_status,
+                    "description": description,
+                    "report_time": reported_at,
+                    "position": position,
+                }
+            )
+
+        return grouped
+
+    def _collect_game_injuries(
+        self,
+        game_id: str,
+        home_team: Optional[str],
+        away_team: Optional[str],
+        grouped: Dict[str, List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for team_code in filter(None, {normalize_team_abbr(home_team), normalize_team_abbr(away_team)}):
+            for base_row in grouped.get(team_code, []):
+                player_key = normalize_player_name(base_row.get("player_name"))
+                if not player_key:
+                    continue
+                row = dict(base_row)
+                row["team"] = team_code
+                row["game_id"] = str(game_id)
+                base_id = row.get("injury_id") or uuid.uuid4().hex
+                row["injury_id"] = f"{game_id}:{base_id}"
+                if row.get("report_time") and not isinstance(row["report_time"], dt.datetime):
+                    row["report_time"] = parse_dt(row["report_time"])
+                row["position"] = normalize_position(row.get("position"))
+                rows.append(row)
+        return rows
+
+    def _merge_injury_rows(
+        self,
+        msf_rows: List[Dict[str, Any]],
+        supplemental_rows: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        def _ingest(rows: List[Dict[str, Any]], priority: int) -> None:
+            for row in rows or []:
+                team = normalize_team_abbr(row.get("team"))
+                player_name = row.get("player_name")
+                player_key = normalize_player_name(player_name)
+                if not team or not player_key:
+                    continue
+
+                record = dict(row)
+                record["team"] = team
+                record["player_name"] = player_name
+                record["position"] = normalize_position(record.get("position"))
+                record.setdefault("game_id", row.get("game_id"))
+                record.setdefault("injury_id", uuid.uuid4().hex)
+                if record.get("injury_id") and record.get("game_id"):
+                    if not str(record["injury_id"]).startswith(str(record["game_id"])):
+                        record["injury_id"] = f"{record['game_id']}:{record['injury_id']}"
+
+                if record.get("report_time") and not isinstance(record["report_time"], dt.datetime):
+                    record["report_time"] = parse_dt(record["report_time"])
+
+                key = (team, player_key)
+                existing = merged.get(key)
+                if not existing:
+                    record["_priority"] = priority
+                    merged[key] = record
+                    continue
+
+                # prefer lower priority value (0 beats 1) but always merge fresh details
+                if existing.get("_priority", priority) > priority:
+                    for field in ("status", "practice_status", "description", "position", "report_time"):
+                        if not record.get(field) and existing.get(field):
+                            record[field] = existing[field]
+                    record["_priority"] = priority
+                    merged[key] = record
+                else:
+                    for field in ("status", "practice_status", "description", "position"):
+                        if not existing.get(field) and record.get(field):
+                            existing[field] = record[field]
+                    if record.get("report_time") and (
+                        not existing.get("report_time")
+                        or (
+                            isinstance(existing.get("report_time"), dt.datetime)
+                            and isinstance(record.get("report_time"), dt.datetime)
+                            and record["report_time"] > existing["report_time"]
+                        )
+                    ):
+                        existing["report_time"] = record["report_time"]
+
+        _ingest(msf_rows, 0)
+        _ingest(supplemental_rows, 1)
+
+        output: List[Dict[str, Any]] = []
+        for record in merged.values():
+            record.pop("_priority", None)
+            game_id = record.get("game_id")
+            if not game_id:
+                continue
+            bucket = compute_injury_bucket(record.get("status"), record.get("description"))
+            practice_bucket = normalize_practice_status(record.get("practice_status"))
+            if bucket == "other" and practice_bucket == "available":
+                continue
+            record["practice_status"] = record.get("practice_status")
+            record["status"] = record.get("status")
+            output.append(record)
+        return output
+
+    def _summarize_injury_rows(self, injuries: List[Dict[str, Any]]) -> Optional[str]:
+        if not injuries:
+            return None
+        parts: List[str] = []
+        for row in injuries:
+            player_name = row.get("player_name")
+            if not player_name:
+                continue
+            bucket = compute_injury_bucket(row.get("status"), row.get("description"))
+            practice_bucket = normalize_practice_status(row.get("practice_status"))
+            if bucket == "other" and practice_bucket == "available":
+                continue
+            label = bucket if bucket != "other" else practice_bucket
+            if not label:
+                continue
+            parts.append(f"{player_name}({label})")
+        if not parts:
+            return None
+        preview = parts[:6]
+        summary = ", ".join(preview)
+        remaining = len(parts) - len(preview)
+        if remaining > 0:
+            summary += f" +{remaining} more"
+        return summary
+
+    def _build_lineup_game_key(
+        self,
+        start_time: Optional[dt.datetime],
+        away_team: Optional[str],
+        home_team: Optional[str],
+    ) -> Optional[str]:
+        if not start_time or not away_team or not home_team:
+            return None
+        eastern = ZoneInfo("America/New_York")
+        kickoff = start_time
+        if kickoff.tzinfo is None:
+            kickoff = kickoff.replace(tzinfo=dt.timezone.utc)
+        kickoff_local = kickoff.astimezone(eastern)
+        date_str = kickoff_local.strftime("%Y%m%d")
+        return f"{date_str}-{away_team}-{home_team}"
+
+    def _lineup_season_candidates(
+        self, season: Optional[str], start_time: Optional[dt.datetime]
+    ) -> List[str]:
+        candidates: List[str] = []
+        seen: set[str] = set()
+
+        def add(slug: Optional[str]) -> None:
+            if slug:
+                value = str(slug)
+                if value and value not in seen:
+                    seen.add(value)
+                    candidates.append(value)
+
+        if season:
+            season_str = str(season)
+            add(season_str)
+            match = re.match(r"^(\d{4})(?:-(\d{4}))?-regular$", season_str)
+            if match:
+                start_year = int(match.group(1))
+                end_year = match.group(2)
+                if end_year:
+                    add(f"{start_year}-regular")
+                else:
+                    add(f"{start_year}-{start_year + 1}-regular")
+
+        if start_time is not None:
+            kickoff = start_time
+            if kickoff.tzinfo is None:
+                kickoff = kickoff.replace(tzinfo=dt.timezone.utc)
+            kickoff_local = kickoff.astimezone(ZoneInfo("America/New_York"))
+            season_year = kickoff_local.year
+            if kickoff_local.month < 3:
+                season_year -= 1
+            add(f"{season_year}-{season_year + 1}-regular")
+            add(f"{season_year}-regular")
+
+        if not candidates and season:
+            add(str(season))
+
+        return candidates
+
+    def _parse_lineup_position(self, label: Any) -> Tuple[str, Optional[int]]:
+        if not label:
+            return "", None
+        parts = str(label).split("-")
+        rank: Optional[int] = None
+        base_position: Optional[str] = None
+        for part in reversed(parts):
+            if rank is None and part.isdigit():
+                try:
+                    rank = int(part)
+                except ValueError:
+                    rank = None
+                continue
+            if base_position is None:
+                cleaned = re.sub(r"[^A-Za-z]", "", part or "")
+                if cleaned:
+                    base_position = normalize_position(cleaned)
+                    if base_position:
+                        break
+        if base_position is None:
+            base_position = normalize_position(parts[-1] if parts else "")
+        return base_position or "", rank
+
+    def _lineup_rows_from_msf(
+        self,
+        season: str,
+        start_time: Optional[dt.datetime],
+        away_team: Optional[str],
+        home_team: Optional[str],
+        cache: Dict[Tuple[str, str], List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        game_key = self._build_lineup_game_key(start_time, away_team, home_team)
+        if not game_key:
+            return []
+        season_candidates = [
+            slug for slug in self._lineup_season_candidates(season, start_time) if slug
+        ]
+        if not season_candidates and season:
+            season_candidates = [str(season)]
+        if not season_candidates:
+            cache[("", game_key)] = []
+            return []
+        payload: Dict[str, Any] = {}
+        used_slug: Optional[str] = None
+
+        for season_slug in season_candidates:
+            cache_key = (season_slug, game_key)
+            if cache_key in cache:
+                return cache[cache_key]
+            payload = self.msf_client.fetch_game_lineup(season_slug, game_key)
+            if payload:
+                used_slug = season_slug
+                break
+        else:
+            cache[(season_candidates[0], game_key)] = []
+            return []
+
+        last_updated = parse_dt(payload.get("lastUpdatedOn")) if isinstance(payload, dict) else None
+        lineup_rows: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        team_lineups = []
+        if isinstance(payload, dict):
+            if isinstance(payload.get("teamLineups"), list):
+                team_lineups = payload["teamLineups"]
+
+        section_priority = {"actual": 0, "expected": 1}
+
+        for team_entry in team_lineups:
+            team_abbr = normalize_team_abbr(
+                (team_entry.get("team") or {}).get("abbreviation")
+                or (team_entry.get("team") or {}).get("name")
+            )
+            if not team_abbr:
+                continue
+
+            for section_name in ("actual", "expected"):
+                section = team_entry.get(section_name) or {}
+                lineup_positions = section.get("lineupPositions") or []
+                for position_entry in lineup_positions:
+                    base_position, rank = self._parse_lineup_position(position_entry.get("position"))
+                    if not base_position:
+                        continue
+                    player = position_entry.get("player") or {}
+                    player_name = " ".join(
+                        part
+                        for part in [player.get("firstName"), player.get("lastName")] if part
+                    ).strip() or player.get("displayName") or ""
+                    if not player_name:
+                        continue
+                    player_id = player.get("id")
+                    player_key = normalize_player_name(player_name)
+                    if not player_key and not player_id:
+                        continue
+                    depth_id = (
+                        f"msf-lineup:{team_abbr}:{base_position}:{player_id}" if player_id is not None else f"msf-lineup:{team_abbr}:{base_position}:{player_key}"
+                    )
+                    key = (team_abbr, depth_id)
+                    existing = lineup_rows.get(key)
+                    current_priority = section_priority.get(section_name, 1)
+                    if existing and existing.get("_priority", 1) < current_priority:
+                        continue
+                    lineup_rows[key] = {
+                        "depth_id": depth_id,
+                        "team": team_abbr,
+                        "position": base_position,
+                        "player_id": str(player_id) if player_id is not None else "",
+                        "player_name": player_name,
+                        "rank": rank,
+                        "updated_at": last_updated,
+                        "_priority": current_priority,
+                    }
+
+        rows: List[Dict[str, Any]] = []
+        for record in lineup_rows.values():
+            record.pop("_priority", None)
+            rows.append(record)
+
+        cache_key = (used_slug or season, game_key)
+        cache[cache_key] = rows
+        if season and cache_key[0] != season:
+            cache[(season, game_key)] = rows
+        return rows
 
     @staticmethod
     def _safe_float(value: Any) -> Optional[float]:
