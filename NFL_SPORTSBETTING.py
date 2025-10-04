@@ -352,6 +352,9 @@ INJURY_STATUS_MAP = {
     "non-football injury": "out",
     "pup": "out",
     "ir": "out",
+    "injury list": "out",
+    "injury_list": "out",
+    "injurylist": "out",
 }
 
 INJURY_OUT_KEYWORDS = [
@@ -366,6 +369,9 @@ INJURY_OUT_KEYWORDS = [
     "nfi",
     "pup",
     "physically unable to perform",
+    "injury list",
+    "injury_list",
+    "injurylist",
 ]
 
 INJURY_STATUS_PRIORITY = {
@@ -399,6 +405,9 @@ PRACTICE_STATUS_ALIASES = {
     "rest": "rest",
     "not injury related": "rest",
     "available": "available",
+    "injury list": "dnp",
+    "injury_list": "dnp",
+    "injurylist": "dnp",
 }
 
 INACTIVE_INJURY_BUCKETS = {"out", "suspended"}
