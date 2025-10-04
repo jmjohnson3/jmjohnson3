@@ -1865,7 +1865,19 @@ class NFLIngestor:
             cache_key = (season_slug, game_key)
             if cache_key in cache:
                 return cache[cache_key]
-            payload = self.msf_client.fetch_game_lineup(season_slug, game_key)
+            try:
+                payload = self.msf_client.fetch_game_lineup(season_slug, game_key)
+            except HTTPError as exc:  # type: ignore[name-defined]
+                status = getattr(exc.response, "status_code", None)
+                if status in {400, 404}:
+                    logging.debug(
+                        "No lineup data for %s game %s (HTTP %s)",
+                        season_slug,
+                        game_key,
+                        status,
+                    )
+                    continue
+                raise
             if payload:
                 used_slug = season_slug
                 break
@@ -3141,8 +3153,31 @@ class FeatureBuilder:
                 how="left",
                 suffixes=("", "_depth"),
             )
-            latest_players["depth_rank"] = latest_players[["depth_rank", "rank_depth"]].bfill(axis=1).iloc[:, 0]
-            latest_players = latest_players.drop(columns=["rank_depth"], errors="ignore")
+
+            depth_rank_sources = [
+                col
+                for col in ("depth_rank", "rank_depth", "rank")
+                if col in latest_players.columns
+            ]
+
+            if depth_rank_sources:
+                latest_players["depth_rank"] = (
+                    latest_players[depth_rank_sources]
+                    .bfill(axis=1)
+                    .iloc[:, 0]
+                )
+            else:
+                latest_players["depth_rank"] = np.nan
+
+            columns_to_drop = [
+                col
+                for col in ("rank_depth", "rank")
+                if col in latest_players.columns and col != "depth_rank"
+            ]
+            if columns_to_drop:
+                latest_players = latest_players.drop(
+                    columns=columns_to_drop, errors="ignore"
+                )
         else:
             latest_players["depth_rank"] = latest_players.get("depth_rank", np.nan)
 
