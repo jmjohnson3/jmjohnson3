@@ -3019,6 +3019,12 @@ class FeatureBuilder:
             depth_latest = depth_latest.drop_duplicates(
                 subset=["team", "position", "player_name_norm"], keep="last"
             )
+            if "depth_id" in depth_latest.columns:
+                depth_latest["_lineup_entry"] = depth_latest["depth_id"].astype(str).str.startswith(
+                    "msf-lineup:"
+                )
+            else:
+                depth_latest["_lineup_entry"] = False
 
         latest_players["player_name_norm"] = latest_players["player_name"].apply(
             normalize_player_name
@@ -3185,8 +3191,13 @@ class FeatureBuilder:
             )
 
         if not depth_latest.empty:
+            merge_columns = ["team", "position", "player_name_norm", "rank"]
+            for optional in ("_lineup_entry", "depth_id", "updated_at"):
+                if optional in depth_latest.columns:
+                    merge_columns.append(optional)
+
             latest_players = latest_players.merge(
-                depth_latest[["team", "position", "player_name_norm", "rank"]],
+                depth_latest[merge_columns],
                 on=["team", "position", "player_name_norm"],
                 how="left",
                 suffixes=("", "_depth"),
@@ -3209,7 +3220,7 @@ class FeatureBuilder:
 
             columns_to_drop = [
                 col
-                for col in ("rank_depth", "rank")
+                for col in ("rank_depth", "rank", "depth_id", "updated_at")
                 if col in latest_players.columns and col != "depth_rank"
             ]
             if columns_to_drop:
@@ -3234,6 +3245,18 @@ class FeatureBuilder:
         latest_players["depth_rank"] = pd.to_numeric(
             latest_players["depth_rank"], errors="coerce"
         )
+        if "_lineup_entry" in latest_players.columns:
+            lineup_mask = latest_players["_lineup_entry"].fillna(False).astype(bool)
+            starter_mask = lineup_mask & (
+                latest_players["depth_rank"].isna()
+                | (latest_players["depth_rank"] <= 1.5)
+            )
+            latest_players["is_projected_starter"] = starter_mask
+            latest_players = latest_players.drop(
+                columns=["_lineup_entry"], errors="ignore"
+            )
+        else:
+            latest_players["is_projected_starter"] = False
         latest_players["depth_rank"] = latest_players["depth_rank"].fillna(99.0)
 
         games = upcoming_games.copy()
@@ -3373,6 +3396,13 @@ class FeatureBuilder:
 
                     sort_columns: List[str] = []
                     ascending_flags: List[bool] = []
+
+                    if "is_projected_starter" in position_candidates.columns:
+                        position_candidates["is_projected_starter"] = (
+                            position_candidates["is_projected_starter"].fillna(False).astype(bool)
+                        )
+                        sort_columns.append("is_projected_starter")
+                        ascending_flags.append(False)
 
                     if "depth_rank" in position_candidates.columns:
                         sort_columns.append("depth_rank")
