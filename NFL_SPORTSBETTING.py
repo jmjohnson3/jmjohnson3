@@ -3407,6 +3407,13 @@ class FeatureBuilder:
                             "injury_priority"
                         ].fillna(INJURY_STATUS_PRIORITY.get("other", 1))
 
+                    if "is_projected_starter" not in position_candidates.columns:
+                        position_candidates["is_projected_starter"] = False
+                    else:
+                        position_candidates["is_projected_starter"] = (
+                            position_candidates["is_projected_starter"].fillna(False).astype(bool)
+                        )
+
                     position_candidates["practice_status"] = position_candidates[
                         "practice_status"
                     ].apply(normalize_practice_status)
@@ -3499,16 +3506,26 @@ class FeatureBuilder:
                     position_candidates = position_candidates.sort_values(
                         sort_columns, ascending=ascending_flags
                     )
+
+                    starters_first = position_candidates[
+                        position_candidates["is_projected_starter"]
+                    ]
+                    backups_after = position_candidates[
+                        ~position_candidates["is_projected_starter"]
+                    ]
                     pos_selected = 0
-                    for _, player_row in position_candidates.iterrows():
-                        player_id = player_row.get("player_id")
-                        if player_id in used_player_ids:
-                            continue
-                        chosen_players.append(player_row)
-                        used_player_ids.add(player_id)
-                        pos_selected += 1
+                    for pool in (starters_first, backups_after):
                         if pos_selected >= count:
                             break
+                        for _, player_row in pool.iterrows():
+                            player_id = player_row.get("player_id")
+                            if player_id in used_player_ids:
+                                continue
+                            chosen_players.append(player_row)
+                            used_player_ids.add(player_id)
+                            pos_selected += 1
+                            if pos_selected >= count:
+                                break
 
                 if not chosen_players:
                     continue
