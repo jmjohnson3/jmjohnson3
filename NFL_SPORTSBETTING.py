@@ -352,6 +352,9 @@ INJURY_STATUS_MAP = {
     "non-football injury": "out",
     "pup": "out",
     "ir": "out",
+    "injury list": "out",
+    "injury_list": "out",
+    "injurylist": "out",
 }
 
 INJURY_OUT_KEYWORDS = [
@@ -366,6 +369,9 @@ INJURY_OUT_KEYWORDS = [
     "nfi",
     "pup",
     "physically unable to perform",
+    "injury list",
+    "injury_list",
+    "injurylist",
 ]
 
 INJURY_STATUS_PRIORITY = {
@@ -399,6 +405,9 @@ PRACTICE_STATUS_ALIASES = {
     "rest": "rest",
     "not injury related": "rest",
     "available": "available",
+    "injury list": "dnp",
+    "injury_list": "dnp",
+    "injurylist": "dnp",
 }
 
 INACTIVE_INJURY_BUCKETS = {"out", "suspended"}
@@ -3010,6 +3019,12 @@ class FeatureBuilder:
             depth_latest = depth_latest.drop_duplicates(
                 subset=["team", "position", "player_name_norm"], keep="last"
             )
+            if "depth_id" in depth_latest.columns:
+                depth_latest["_lineup_entry"] = depth_latest["depth_id"].astype(str).str.startswith(
+                    "msf-lineup:"
+                )
+            else:
+                depth_latest["_lineup_entry"] = False
 
         latest_players["player_name_norm"] = latest_players["player_name"].apply(
             normalize_player_name
@@ -3017,6 +3032,11 @@ class FeatureBuilder:
 
         if "depth_rank" not in latest_players.columns:
             latest_players["depth_rank"] = np.nan
+
+        if "status_bucket" not in latest_players.columns:
+            latest_players["status_bucket"] = np.nan
+        if "practice_status" not in latest_players.columns:
+            latest_players["practice_status"] = np.nan
 
         template_columns = latest_players.columns.tolist()
 
@@ -3141,14 +3161,43 @@ class FeatureBuilder:
                 ],
                 on=["team", "player_name_norm"],
                 how="left",
+                suffixes=("", "_inj"),
             )
+
+            if "status_bucket_inj" in latest_players.columns:
+                latest_players["status_bucket"] = latest_players[
+                    "status_bucket_inj"
+                ].combine_first(latest_players.get("status_bucket"))
+                latest_players = latest_players.drop(
+                    columns=["status_bucket_inj"], errors="ignore"
+                )
+
+            if "practice_status_inj" in latest_players.columns:
+                latest_players["practice_status"] = latest_players[
+                    "practice_status_inj"
+                ].combine_first(latest_players.get("practice_status"))
+                latest_players = latest_players.drop(
+                    columns=["practice_status_inj"], errors="ignore"
+                )
+
+            if "status_inj" in latest_players.columns and "status" not in latest_players:
+                latest_players = latest_players.rename(
+                    columns={"status_inj": "status"}
+                )
         else:
-            latest_players["status_bucket"] = np.nan
-            latest_players["practice_status"] = np.nan
+            latest_players["status_bucket"] = latest_players.get("status_bucket", np.nan)
+            latest_players["practice_status"] = latest_players.get(
+                "practice_status", np.nan
+            )
 
         if not depth_latest.empty:
+            merge_columns = ["team", "position", "player_name_norm", "rank"]
+            for optional in ("_lineup_entry", "depth_id", "updated_at"):
+                if optional in depth_latest.columns:
+                    merge_columns.append(optional)
+
             latest_players = latest_players.merge(
-                depth_latest[["team", "position", "player_name_norm", "rank"]],
+                depth_latest[merge_columns],
                 on=["team", "position", "player_name_norm"],
                 how="left",
                 suffixes=("", "_depth"),
@@ -3171,7 +3220,7 @@ class FeatureBuilder:
 
             columns_to_drop = [
                 col
-                for col in ("rank_depth", "rank")
+                for col in ("rank_depth", "rank", "depth_id", "updated_at")
                 if col in latest_players.columns and col != "depth_rank"
             ]
             if columns_to_drop:
@@ -3196,6 +3245,21 @@ class FeatureBuilder:
         latest_players["depth_rank"] = pd.to_numeric(
             latest_players["depth_rank"], errors="coerce"
         )
+        if "_lineup_entry" in latest_players.columns:
+            lineup_mask = latest_players["_lineup_entry"].fillna(False).astype(bool)
+            starter_allowance = (
+                latest_players["position"].fillna("").map(starters_per_position).fillna(1)
+            )
+            starter_mask = lineup_mask & (
+                latest_players["depth_rank"].isna()
+                | (latest_players["depth_rank"] <= starter_allowance)
+            )
+            latest_players["is_projected_starter"] = starter_mask
+            latest_players = latest_players.drop(
+                columns=["_lineup_entry"], errors="ignore"
+            )
+        else:
+            latest_players["is_projected_starter"] = False
         latest_players["depth_rank"] = latest_players["depth_rank"].fillna(99.0)
 
         games = upcoming_games.copy()
@@ -3335,6 +3399,13 @@ class FeatureBuilder:
 
                     sort_columns: List[str] = []
                     ascending_flags: List[bool] = []
+
+                    if "is_projected_starter" in position_candidates.columns:
+                        position_candidates["is_projected_starter"] = (
+                            position_candidates["is_projected_starter"].fillna(False).astype(bool)
+                        )
+                        sort_columns.append("is_projected_starter")
+                        ascending_flags.append(False)
 
                     if "depth_rank" in position_candidates.columns:
                         sort_columns.append("depth_rank")
