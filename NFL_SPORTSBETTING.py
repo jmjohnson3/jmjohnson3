@@ -33,6 +33,7 @@ import numpy as np
 import pandas as pd
 import requests
 from requests import HTTPError
+from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
 from sklearn.base import clone
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
@@ -352,6 +353,9 @@ INJURY_STATUS_MAP = {
     "non-football injury": "out",
     "pup": "out",
     "ir": "out",
+    "injury list": "out",
+    "injury_list": "out",
+    "injurylist": "out",
 }
 
 INJURY_OUT_KEYWORDS = [
@@ -366,6 +370,9 @@ INJURY_OUT_KEYWORDS = [
     "nfi",
     "pup",
     "physically unable to perform",
+    "injury list",
+    "injury_list",
+    "injurylist",
 ]
 
 INJURY_STATUS_PRIORITY = {
@@ -399,6 +406,9 @@ PRACTICE_STATUS_ALIASES = {
     "rest": "rest",
     "not injury related": "rest",
     "available": "available",
+    "injury list": "dnp",
+    "injury_list": "dnp",
+    "injurylist": "dnp",
 }
 
 INACTIVE_INJURY_BUCKETS = {"out", "suspended"}
@@ -1059,7 +1069,22 @@ class MySportsFeedsClient:
         logging.debug("Requesting MySportsFeeds endpoint %s", url)
         resp = requests.get(url, params=params, auth=self.auth, timeout=self.timeout)
         resp.raise_for_status()
-        return resp.json()
+        try:
+            return resp.json()
+        except RequestsJSONDecodeError:
+            content = resp.text.strip()
+            if not content:
+                logging.debug(
+                    "Empty response body for MySportsFeeds endpoint %s; returning empty payload",
+                    url,
+                )
+                return {}
+            logging.warning(
+                "Failed to decode JSON from MySportsFeeds endpoint %s (content-type=%s)",
+                url,
+                resp.headers.get("Content-Type"),
+            )
+            raise
 
     def fetch_games(self, season: str) -> List[Dict[str, Any]]:
         """Fetch the schedule for a season, retrying with alternative filters."""
@@ -1950,6 +1975,20 @@ class NFLIngestor:
         if season and cache_key[0] != season:
             cache[(season, game_key)] = rows
         return rows
+
+    def fetch_lineup_rows(
+        self,
+        season: Optional[str],
+        start_time: Optional[dt.datetime],
+        away_team: Optional[str],
+        home_team: Optional[str],
+        cache: Optional[Dict[Tuple[str, str], List[Dict[str, Any]]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Public helper to retrieve MSF lineup rows for the given matchup."""
+
+        cache = cache or {}
+        season_slug = str(season) if season is not None else ""
+        return self._lineup_rows_from_msf(season_slug, start_time, away_team, home_team, cache)
 
     @staticmethod
     def _safe_float(value: Any) -> Optional[float]:
@@ -2873,6 +2912,7 @@ class FeatureBuilder:
         self,
         upcoming_games: pd.DataFrame,
         starters_per_position: Optional[Dict[str, int]] = None,
+        lineup_rows: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         if (
             self.player_feature_frame is None
@@ -3005,8 +3045,49 @@ class FeatureBuilder:
             depth_latest["updated_at"] = pd.to_datetime(
                 depth_latest["updated_at"], errors="coerce"
             )
-            depth_latest = depth_latest.sort_values("updated_at")
             depth_latest["rank"] = depth_latest["rank"].apply(parse_depth_rank)
+            if "depth_id" in depth_latest.columns:
+                depth_latest["_lineup_entry"] = depth_latest["depth_id"].astype(str).str.startswith(
+                    "msf-lineup:"
+                )
+            else:
+                depth_latest["_lineup_entry"] = False
+
+        if lineup_rows is not None and not lineup_rows.empty:
+            lineup_latest = lineup_rows.copy()
+            lineup_latest["team"] = lineup_latest["team"].apply(normalize_team_abbr)
+            lineup_latest["position"] = lineup_latest["position"].apply(normalize_position)
+            lineup_latest["player_name_norm"] = lineup_latest["player_name"].apply(
+                normalize_player_name
+            )
+            lineup_latest = lineup_latest[
+                (lineup_latest["player_name_norm"] != "")
+                & (lineup_latest["position"] != "")
+            ]
+            lineup_latest["updated_at"] = pd.to_datetime(
+                lineup_latest["updated_at"], errors="coerce"
+            )
+            lineup_latest["rank"] = lineup_latest["rank"].apply(parse_depth_rank)
+            if "depth_id" in lineup_latest.columns:
+                lineup_latest["_lineup_entry"] = True
+            else:
+                lineup_latest["depth_id"] = lineup_latest.apply(
+                    lambda row: f"msf-lineup:{row['team']}:{row['position']}:{row['player_name_norm']}",
+                    axis=1,
+                )
+                lineup_latest["_lineup_entry"] = True
+
+            if depth_latest.empty:
+                depth_latest = lineup_latest
+            else:
+                depth_latest = pd.concat(
+                    [depth_latest, lineup_latest], ignore_index=True, sort=False
+                )
+
+        if not depth_latest.empty:
+            depth_latest = depth_latest.sort_values(
+                ["_lineup_entry", "updated_at"], ascending=[True, True]
+            )
             depth_latest = depth_latest.drop_duplicates(
                 subset=["team", "position", "player_name_norm"], keep="last"
             )
@@ -3017,6 +3098,11 @@ class FeatureBuilder:
 
         if "depth_rank" not in latest_players.columns:
             latest_players["depth_rank"] = np.nan
+
+        if "status_bucket" not in latest_players.columns:
+            latest_players["status_bucket"] = np.nan
+        if "practice_status" not in latest_players.columns:
+            latest_players["practice_status"] = np.nan
 
         template_columns = latest_players.columns.tolist()
 
@@ -3141,14 +3227,43 @@ class FeatureBuilder:
                 ],
                 on=["team", "player_name_norm"],
                 how="left",
+                suffixes=("", "_inj"),
             )
+
+            if "status_bucket_inj" in latest_players.columns:
+                latest_players["status_bucket"] = latest_players[
+                    "status_bucket_inj"
+                ].combine_first(latest_players.get("status_bucket"))
+                latest_players = latest_players.drop(
+                    columns=["status_bucket_inj"], errors="ignore"
+                )
+
+            if "practice_status_inj" in latest_players.columns:
+                latest_players["practice_status"] = latest_players[
+                    "practice_status_inj"
+                ].combine_first(latest_players.get("practice_status"))
+                latest_players = latest_players.drop(
+                    columns=["practice_status_inj"], errors="ignore"
+                )
+
+            if "status_inj" in latest_players.columns and "status" not in latest_players:
+                latest_players = latest_players.rename(
+                    columns={"status_inj": "status"}
+                )
         else:
-            latest_players["status_bucket"] = np.nan
-            latest_players["practice_status"] = np.nan
+            latest_players["status_bucket"] = latest_players.get("status_bucket", np.nan)
+            latest_players["practice_status"] = latest_players.get(
+                "practice_status", np.nan
+            )
 
         if not depth_latest.empty:
+            merge_columns = ["team", "position", "player_name_norm", "rank"]
+            for optional in ("_lineup_entry", "depth_id", "updated_at"):
+                if optional in depth_latest.columns:
+                    merge_columns.append(optional)
+
             latest_players = latest_players.merge(
-                depth_latest[["team", "position", "player_name_norm", "rank"]],
+                depth_latest[merge_columns],
                 on=["team", "position", "player_name_norm"],
                 how="left",
                 suffixes=("", "_depth"),
@@ -3171,7 +3286,7 @@ class FeatureBuilder:
 
             columns_to_drop = [
                 col
-                for col in ("rank_depth", "rank")
+                for col in ("rank_depth", "rank", "depth_id", "updated_at")
                 if col in latest_players.columns and col != "depth_rank"
             ]
             if columns_to_drop:
@@ -3196,6 +3311,21 @@ class FeatureBuilder:
         latest_players["depth_rank"] = pd.to_numeric(
             latest_players["depth_rank"], errors="coerce"
         )
+        if "_lineup_entry" in latest_players.columns:
+            lineup_mask = latest_players["_lineup_entry"].fillna(False).astype(bool)
+            starter_allowance = (
+                latest_players["position"].fillna("").map(starters_per_position).fillna(1)
+            )
+            starter_mask = lineup_mask & (
+                latest_players["depth_rank"].isna()
+                | (latest_players["depth_rank"] <= starter_allowance)
+            )
+            latest_players["is_projected_starter"] = starter_mask
+            latest_players = latest_players.drop(
+                columns=["_lineup_entry"], errors="ignore"
+            )
+        else:
+            latest_players["is_projected_starter"] = False
         latest_players["depth_rank"] = latest_players["depth_rank"].fillna(99.0)
 
         games = upcoming_games.copy()
@@ -3271,6 +3401,13 @@ class FeatureBuilder:
                             "injury_priority"
                         ].fillna(INJURY_STATUS_PRIORITY.get("other", 1))
 
+                    if "is_projected_starter" not in position_candidates.columns:
+                        position_candidates["is_projected_starter"] = False
+                    else:
+                        position_candidates["is_projected_starter"] = (
+                            position_candidates["is_projected_starter"].fillna(False).astype(bool)
+                        )
+
                     position_candidates["practice_status"] = position_candidates[
                         "practice_status"
                     ].apply(normalize_practice_status)
@@ -3336,6 +3473,13 @@ class FeatureBuilder:
                     sort_columns: List[str] = []
                     ascending_flags: List[bool] = []
 
+                    if "is_projected_starter" in position_candidates.columns:
+                        position_candidates["is_projected_starter"] = (
+                            position_candidates["is_projected_starter"].fillna(False).astype(bool)
+                        )
+                        sort_columns.append("is_projected_starter")
+                        ascending_flags.append(False)
+
                     if "depth_rank" in position_candidates.columns:
                         sort_columns.append("depth_rank")
                         ascending_flags.append(True)
@@ -3356,16 +3500,26 @@ class FeatureBuilder:
                     position_candidates = position_candidates.sort_values(
                         sort_columns, ascending=ascending_flags
                     )
+
+                    starters_first = position_candidates[
+                        position_candidates["is_projected_starter"]
+                    ]
+                    backups_after = position_candidates[
+                        ~position_candidates["is_projected_starter"]
+                    ]
                     pos_selected = 0
-                    for _, player_row in position_candidates.iterrows():
-                        player_id = player_row.get("player_id")
-                        if player_id in used_player_ids:
-                            continue
-                        chosen_players.append(player_row)
-                        used_player_ids.add(player_id)
-                        pos_selected += 1
+                    for pool in (starters_first, backups_after):
                         if pos_selected >= count:
                             break
+                        for _, player_row in pool.iterrows():
+                            player_id = player_row.get("player_id")
+                            if player_id in used_player_ids:
+                                continue
+                            chosen_players.append(player_row)
+                            used_player_ids.add(player_id)
+                            pos_selected += 1
+                            if pos_selected >= count:
+                                break
 
                 if not chosen_players:
                     continue
@@ -4687,6 +4841,7 @@ def predict_upcoming_games(
     model_uncertainty: Optional[Dict[str, Dict[str, float]]] = None,
     output_path: Optional[Path] = None,
     save_json: bool = False,
+    ingestor: Optional["NFLIngestor"] = None,
 ) -> Dict[str, pd.DataFrame]:
     feature_builder = FeatureBuilder(engine)
     feature_builder.build_features()
@@ -4879,7 +5034,71 @@ def predict_upcoming_games(
     scoreboard = scoreboard.sort_values(["date", "start_time", "game_id"]).reset_index(drop=True)
 
     # Player-level predictions
-    player_features = feature_builder.prepare_upcoming_player_features(upcoming)
+    lineup_df = pd.DataFrame()
+    if ingestor is not None:
+        lineup_cache: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        lineup_records: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for game in upcoming.itertuples():
+            season_val = getattr(game, "season", None)
+            start_time = getattr(game, "start_time", None)
+            away_team = getattr(game, "away_team", None)
+            home_team = getattr(game, "home_team", None)
+            if not away_team or not home_team:
+                continue
+            rows = ingestor.fetch_lineup_rows(
+                season_val,
+                start_time,
+                away_team,
+                home_team,
+                cache=lineup_cache,
+            )
+            for row in rows:
+                team = normalize_team_abbr(row.get("team"))
+                position = normalize_position(row.get("position"))
+                player_name = row.get("player_name") or ""
+                if not team or not position or not player_name:
+                    continue
+                player_name_norm = normalize_player_name(player_name)
+                if not player_name_norm:
+                    continue
+                raw_player_id = row.get("player_id")
+                player_id = (
+                    str(raw_player_id)
+                    if raw_player_id not in (None, "")
+                    else f"lineup_{team}_{player_name_norm}"
+                )
+                updated_at = row.get("updated_at")
+                if isinstance(updated_at, str):
+                    updated_at = parse_dt(updated_at)
+                depth_id = row.get("depth_id")
+                if not depth_id:
+                    depth_id = f"msf-lineup:{team}:{position}:{player_name_norm}"
+
+                record = {
+                    "depth_id": depth_id,
+                    "team": team,
+                    "position": position,
+                    "player_id": player_id,
+                    "player_name": player_name,
+                    "rank": row.get("rank"),
+                    "updated_at": updated_at,
+                    "player_name_norm": player_name_norm,
+                }
+                key = (team, player_name_norm)
+                existing = lineup_records.get(key)
+                existing_ts = existing.get("updated_at") if existing else None
+                existing_ts = pd.to_datetime(existing_ts) if existing_ts is not None else None
+                new_ts = pd.to_datetime(updated_at) if updated_at is not None else None
+                if existing is None or (existing_ts or pd.Timestamp.min) <= (new_ts or pd.Timestamp.max):
+                    lineup_records[key] = record
+
+        if lineup_records:
+            lineup_df = pd.DataFrame(lineup_records.values())
+
+    player_features = feature_builder.prepare_upcoming_player_features(
+        upcoming,
+        lineup_rows=lineup_df if not lineup_df.empty else None,
+    )
     player_predictions = pd.DataFrame()
     if not player_features.empty:
         player_predictions = player_features[
@@ -5134,6 +5353,7 @@ def main() -> None:
         trainer.model_uncertainty,
         output_path=args.output if args.predict else None,
         save_json=args.predict,
+        ingestor=ingestor,
     )
 
 
