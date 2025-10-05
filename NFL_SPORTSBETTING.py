@@ -33,6 +33,7 @@ import numpy as np
 import pandas as pd
 import requests
 from requests import HTTPError
+from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
 from sklearn.base import clone
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
@@ -1068,7 +1069,22 @@ class MySportsFeedsClient:
         logging.debug("Requesting MySportsFeeds endpoint %s", url)
         resp = requests.get(url, params=params, auth=self.auth, timeout=self.timeout)
         resp.raise_for_status()
-        return resp.json()
+        try:
+            return resp.json()
+        except RequestsJSONDecodeError:
+            content = resp.text.strip()
+            if not content:
+                logging.debug(
+                    "Empty response body for MySportsFeeds endpoint %s; returning empty payload",
+                    url,
+                )
+                return {}
+            logging.warning(
+                "Failed to decode JSON from MySportsFeeds endpoint %s (content-type=%s)",
+                url,
+                resp.headers.get("Content-Type"),
+            )
+            raise
 
     def fetch_games(self, season: str) -> List[Dict[str, Any]]:
         """Fetch the schedule for a season, retrying with alternative filters."""
