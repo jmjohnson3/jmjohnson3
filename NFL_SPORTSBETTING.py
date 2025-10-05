@@ -3247,9 +3247,12 @@ class FeatureBuilder:
         )
         if "_lineup_entry" in latest_players.columns:
             lineup_mask = latest_players["_lineup_entry"].fillna(False).astype(bool)
+            starter_allowance = (
+                latest_players["position"].fillna("").map(starters_per_position).fillna(1)
+            )
             starter_mask = lineup_mask & (
                 latest_players["depth_rank"].isna()
-                | (latest_players["depth_rank"] <= 1.5)
+                | (latest_players["depth_rank"] <= starter_allowance)
             )
             latest_players["is_projected_starter"] = starter_mask
             latest_players = latest_players.drop(
