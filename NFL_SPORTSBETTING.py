@@ -778,6 +778,60 @@ def _msf_team_abbr(abbr: Optional[str]) -> Optional[str]:
     return _MSF_ABBR_FIX.get(value, value)
 
 
+_HOME_TZ = {
+    "LAC": "America/Los_Angeles",
+    "LAR": "America/Los_Angeles",
+    "LV": "America/Los_Angeles",
+    "SF": "America/Los_Angeles",
+    "SEA": "America/Los_Angeles",
+    "ARI": "America/Phoenix",
+    "DEN": "America/Denver",
+    "CHI": "America/Chicago",
+    "DAL": "America/Chicago",
+    "GB": "America/Chicago",
+    "HOU": "America/Chicago",
+    "KC": "America/Chicago",
+    "MIN": "America/Chicago",
+    "NO": "America/Chicago",
+    "TB": "America/Chicago",
+    "TEN": "America/Chicago",
+    "ATL": "America/New_York",
+    "BAL": "America/New_York",
+    "BUF": "America/New_York",
+    "CAR": "America/New_York",
+    "CIN": "America/New_York",
+    "CLE": "America/New_York",
+    "DET": "America/New_York",
+    "IND": "America/New_York",
+    "JAX": "America/New_York",
+    "MIA": "America/New_York",
+    "NE": "America/New_York",
+    "NYG": "America/New_York",
+    "NYJ": "America/New_York",
+    "PHI": "America/New_York",
+    "PIT": "America/New_York",
+    "WAS": "America/New_York",
+}
+
+
+def _home_local_game_date(utc_start: dt.datetime, home_abbr: str) -> dt.date:
+    tz_name = _HOME_TZ.get(home_abbr)
+    if not tz_name:
+        logging.warning(
+            "Unknown home timezone for %s; defaulting to America/New_York",
+            home_abbr,
+        )
+        tz = ZoneInfo("America/New_York")
+    else:
+        tz = ZoneInfo(tz_name)
+    kickoff = utc_start
+    if kickoff.tzinfo is None:
+        kickoff = kickoff.replace(tzinfo=ZoneInfo("UTC"))
+    else:
+        kickoff = kickoff.astimezone(ZoneInfo("UTC"))
+    return kickoff.astimezone(tz).date()
+
+
 def _nfl_season_slug_for_start(start_time_utc: Optional[dt.datetime]) -> Optional[str]:
     if not start_time_utc:
         return None
@@ -833,11 +887,12 @@ def _build_msf_lineup_url(
     season_slug = _nfl_season_slug_for_start(start_time_utc)
     if not season_slug:
         return None
-    game_date = _yyyy_mm_dd_from_utc(start_time_utc)
     away_norm = _msf_team_abbr(away_abbr)
     home_norm = _msf_team_abbr(home_abbr)
     if not away_norm or not home_norm:
         return None
+    local_date = _home_local_game_date(start_time_utc, home_norm)
+    game_date = f"{local_date.year:04d}{local_date.month:02d}{local_date.day:02d}"
     return (
         f"https://api.mysportsfeeds.com/v2.1/pull/nfl/{season_slug}/games/"
         f"{game_date}-{away_norm}-{home_norm}/lineup.json"
@@ -2088,7 +2143,8 @@ class NFLIngestor:
             )
             return []
 
-        date_key = _yyyy_mm_dd_from_utc(start_dt)
+        local_date = _home_local_game_date(start_dt, home_norm)
+        date_key = f"{local_date.year:04d}{local_date.month:02d}{local_date.day:02d}"
         cache_key = (date_key, away_norm, home_norm)
         if cache_key in lineup_cache:
             return lineup_cache[cache_key]
@@ -2103,6 +2159,15 @@ class NFLIngestor:
             logging.info("lineup: could not build msf url (start=%s)", start_dt)
             lineup_cache[cache_key] = []
             return []
+
+        logging.debug(
+            "lineup: building URL (UTC=%s, HOME_LOCAL=%s %s @ %s) -> %s",
+            start_dt,
+            local_date,
+            away_norm,
+            home_norm,
+            url,
+        )
 
         auth = HTTPBasicAuth(msf_creds.api_key, msf_creds.password or "MYSPORTSFEEDS")
         response = _http_get_with_retry(url, auth)
