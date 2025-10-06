@@ -26,7 +26,7 @@ import re
 import unicodedata
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -1786,19 +1786,33 @@ class NFLIngestor:
 
     def _build_lineup_game_key(
         self,
-        start_time: Optional[dt.datetime],
+        start_time: Optional[Union[dt.datetime, str]],
         away_team: Optional[str],
         home_team: Optional[str],
     ) -> Optional[str]:
-        if not start_time or not away_team or not home_team:
+        if not away_team or not home_team or not start_time:
             return None
+
+        normalized_away = normalize_team_abbr(away_team)
+        normalized_home = normalize_team_abbr(home_team)
+        if not normalized_away or not normalized_home:
+            return None
+
+        kickoff: Optional[dt.datetime]
+        if isinstance(start_time, str):
+            kickoff = parse_dt(start_time)
+        else:
+            kickoff = start_time
+
+        if kickoff is None:
+            return None
+
         eastern = ZoneInfo("America/New_York")
-        kickoff = start_time
         if kickoff.tzinfo is None:
             kickoff = kickoff.replace(tzinfo=dt.timezone.utc)
         kickoff_local = kickoff.astimezone(eastern)
         date_str = kickoff_local.strftime("%Y%m%d")
-        return f"{date_str}-{away_team}-{home_team}"
+        return f"{date_str}-{normalized_away}-{normalized_home}"
 
     def _lineup_season_candidates(
         self, season: Optional[str], start_time: Optional[dt.datetime]
