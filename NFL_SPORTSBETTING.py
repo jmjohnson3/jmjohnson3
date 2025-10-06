@@ -4484,16 +4484,68 @@ class ModelTrainer:
         self.run_id = run_id or uuid.uuid4().hex
         self.model_uncertainty: Dict[str, Dict[str, float]] = {}
 
+    @staticmethod
+    def _is_lineup_starter(position: str, rank: Optional[int]) -> bool:
+        pos = normalize_position(position)
+        if pos == "QB":
+            return (rank or 99) == 1
+        if pos == "RB":
+            return (rank or 99) == 1
+        if pos == "WR":
+            return (rank or 99) in {1, 2, 3}
+        if pos == "TE":
+            return (rank or 99) == 1
+        return False
+
     def apply_lineup_gate(
         self,
         player_df: pd.DataFrame,
         respect_lineups: bool = True,
+        lineup_df: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         if player_df.empty:
             return player_df
 
         game_ids = sorted(set(map(str, player_df["game_id"].astype(str).tolist())))
         roster_frames: List[pd.DataFrame] = []
+
+        if lineup_df is not None and not lineup_df.empty:
+            lineup_roster = lineup_df.copy()
+            lineup_roster["game_id"] = lineup_roster["game_id"].astype(str)
+            lineup_roster["team"] = lineup_roster["team"].apply(normalize_team_abbr)
+            lineup_roster["position"] = lineup_roster["position"].apply(normalize_position)
+            lineup_roster = lineup_roster[
+                lineup_roster["position"].isin({"QB", "RB", "WR", "TE"})
+            ]
+            if not lineup_roster.empty:
+                lineup_roster["player_id"] = lineup_roster["player_id"].fillna("").astype(str)
+                lineup_roster["player_name"] = lineup_roster["player_name"].fillna("")
+                lineup_roster["depth_rank"] = lineup_roster["rank"].apply(parse_depth_rank)
+                lineup_roster["depth_rank"] = lineup_roster["depth_rank"].apply(
+                    lambda val: int(val) if pd.notna(val) else None
+                )
+                lineup_roster["is_starter"] = lineup_roster.apply(
+                    lambda row: 1
+                    if self._is_lineup_starter(row["position"], row["depth_rank"])
+                    else 0,
+                    axis=1,
+                )
+                lineup_roster["source"] = "msf-lineup"
+                needed_cols = [
+                    "game_id",
+                    "team",
+                    "player_id",
+                    "player_name",
+                    "position",
+                    "depth_rank",
+                    "is_starter",
+                    "source",
+                ]
+                for col in needed_cols:
+                    if col not in lineup_roster.columns:
+                        lineup_roster[col] = np.nan
+                roster_frames.append(lineup_roster[needed_cols])
+
         for gid in game_ids:
             roster_frame = self.db.fetch_game_roster(gid)
             if not roster_frame.empty:
@@ -4507,6 +4559,21 @@ class ModelTrainer:
             return player_df
 
         roster = pd.concat(roster_frames, ignore_index=True)
+        roster["game_id"] = roster["game_id"].astype(str)
+
+        if "source" in roster.columns:
+            roster["_lineup_priority"] = roster["source"].apply(
+                lambda src: 0 if str(src).startswith("msf-lineup") else 1
+            )
+        else:
+            roster["_lineup_priority"] = 1
+        roster = roster.sort_values(
+            ["game_id", "team", "player_id", "player_name", "_lineup_priority"]
+        )
+        roster = roster.drop_duplicates(
+            subset=["game_id", "team", "player_id", "player_name"], keep="first"
+        )
+        roster = roster.drop(columns=["_lineup_priority"], errors="ignore")
 
         def _nname(series: pd.Series) -> pd.Series:
             return series.fillna("").map(normalize_player_name)
@@ -5530,7 +5597,7 @@ def predict_upcoming_games(
     lineup_df = pd.DataFrame()
     if ingestor is not None:
         lineup_cache: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
-        lineup_records: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        lineup_records: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         for game in upcoming.itertuples():
             season_val = getattr(game, "season", None)
             start_time = getattr(game, "start_time", None)
@@ -5567,6 +5634,7 @@ def predict_upcoming_games(
                     depth_id = f"msf-lineup:{team}:{position}:{player_name_norm}"
 
                 record = {
+                    "game_id": str(getattr(game, "game_id", "")),
                     "depth_id": depth_id,
                     "team": team,
                     "position": position,
@@ -5576,7 +5644,7 @@ def predict_upcoming_games(
                     "updated_at": updated_at,
                     "player_name_norm": player_name_norm,
                 }
-                key = (team, player_name_norm)
+                key = (record["game_id"], team, player_name_norm)
                 existing = lineup_records.get(key)
                 existing_ts = existing.get("updated_at") if existing else None
                 existing_ts = pd.to_datetime(existing_ts) if existing_ts is not None else None
@@ -5596,6 +5664,7 @@ def predict_upcoming_games(
         player_features = trainer.apply_lineup_gate(
             player_features,
             respect_lineups=respect_lineups,
+            lineup_df=lineup_df if not lineup_df.empty else None,
         )
     elif respect_lineups:
         logging.warning(
