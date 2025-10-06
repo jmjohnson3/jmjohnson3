@@ -3274,6 +3274,12 @@ class FeatureBuilder:
             depth_latest = depth_latest.drop_duplicates(
                 subset=["team", "position", "player_name_norm"], keep="last"
             )
+            if "depth_id" in depth_latest.columns:
+                depth_latest["_lineup_entry"] = depth_latest["depth_id"].astype(str).str.startswith(
+                    "msf-lineup:"
+                )
+            else:
+                depth_latest["_lineup_entry"] = False
 
         latest_players["player_name_norm"] = latest_players["player_name"].apply(
             normalize_player_name
