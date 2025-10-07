@@ -27,7 +27,7 @@ import time
 import unicodedata
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -5810,19 +5810,65 @@ def predict_upcoming_games(
         )
 
     # Reporting output
+    def _format_table(headers: Sequence[str], rows: Sequence[Sequence[str]], aligns=None) -> List[str]:
+        if aligns is None:
+            aligns = ["left"] * len(headers)
+
+        widths = [len(str(header)) for header in headers]
+        for row in rows:
+            for idx, cell in enumerate(row):
+                widths[idx] = max(widths[idx], len(str(cell)))
+
+        def _fmt(cell: str, width: int, align: str) -> str:
+            text = str(cell)
+            if align == "right":
+                return text.rjust(width)
+            if align == "center":
+                return text.center(width)
+            return text.ljust(width)
+
+        sep = "+".join([""] + ["-" * (w + 2) for w in widths] + [""])
+        header_line = "| " + " | ".join(
+            _fmt(header, width, align)
+            for header, width, align in zip(headers, widths, aligns)
+        ) + " |"
+
+        table_lines = [sep, header_line, sep]
+        for row in rows:
+            formatted = "| " + " | ".join(
+                _fmt(cell, width, align)
+                for cell, width, align in zip(row, widths, aligns)
+            ) + " |"
+            table_lines.append(formatted)
+        table_lines.append(sep)
+        return table_lines
+
     lines: List[str] = []
-    lines.append(
-        "date, away_team_abbr, home_team_abbr, away_score (±RMSE), home_score (±RMSE)"
-    )
-    for row in scoreboard.itertuples(index=False):
-        away_low = row.away_score_lower if not pd.isna(row.away_score_lower) else row.away_score
-        away_high = row.away_score_upper if not pd.isna(row.away_score_upper) else row.away_score
-        home_low = row.home_score_lower if not pd.isna(row.home_score_lower) else row.home_score
-        home_high = row.home_score_upper if not pd.isna(row.home_score_upper) else row.home_score
-        lines.append(
-            f"{row.date}, {row.away_team_abbr}, {row.home_team_abbr}, "
-            f"{row.away_score:.2f} ({away_low:.2f}-{away_high:.2f}), "
-            f"{row.home_score:.2f} ({home_low:.2f}-{home_high:.2f})"
+
+    if not scoreboard.empty:
+        scoreboard_rows: List[List[str]] = []
+        for row in scoreboard.itertuples(index=False):
+            away_low = row.away_score_lower if not pd.isna(row.away_score_lower) else row.away_score
+            away_high = row.away_score_upper if not pd.isna(row.away_score_upper) else row.away_score
+            home_low = row.home_score_lower if not pd.isna(row.home_score_lower) else row.home_score
+            home_high = row.home_score_upper if not pd.isna(row.home_score_upper) else row.home_score
+
+            scoreboard_rows.append(
+                [
+                    str(row.date),
+                    row.away_team_abbr,
+                    row.home_team_abbr,
+                    f"{row.away_score:.2f} ({away_low:.2f}-{away_high:.2f})",
+                    f"{row.home_score:.2f} ({home_low:.2f}-{home_high:.2f})",
+                ]
+            )
+
+        lines.extend(
+            _format_table(
+                ["Date", "Away", "Home", "Away Score ±RMSE", "Home Score ±RMSE"],
+                scoreboard_rows,
+                aligns=["left", "left", "left", "right", "right"],
+            )
         )
 
     if winner_unc:
@@ -5840,31 +5886,75 @@ def predict_upcoming_games(
     if not player_predictions.empty:
         for game in scoreboard.itertuples(index=False):
             lines.append("")
-            lines.append(f"{game.away_team_abbr} vs {game.home_team_abbr}")
-            lines.append("----------")
-            lines.append(
-                "Player Name, Passing Yards, Rushing Yards, Receiving Yards, Receptions, Touchdowns, Passing Touchdowns"
-            )
-            lines.append("=" * 104)
+            lines.append(f"{game.away_team_abbr} at {game.home_team_abbr}")
+            lines.append("".ljust(len(lines[-1]), "-"))
 
             game_players = player_predictions[player_predictions["game_id"] == game.game_id]
             for team in [game.away_team_abbr, game.home_team_abbr]:
-                team_players = game_players[game_players["team"] == team]
-                team_players = team_players.copy()
+                team_players = game_players[game_players["team"] == team].copy()
+                if team_players.empty:
+                    continue
+
                 team_players["_pos_order"] = team_players["position"].map(position_order).fillna(9)
                 team_players = team_players.sort_values(
                     ["_pos_order", "pred_touchdowns", "pred_receptions"], ascending=[True, False, False]
                 )
+
+                rows: List[List[str]] = []
                 for player in team_players.itertuples(index=False):
                     name = player.player_name or "Unknown Player"
-                    lines.append(
-                        f"{name} ({team} {player.position}), "
-                        f"{player.pred_passing_yards:.2f}, "
-                        f"{player.pred_rushing_yards:.2f}, "
-                        f"{player.pred_receiving_yards:.2f}, "
-                        f"{player.pred_receptions:.2f}, "
-                        f"{player.pred_touchdowns:.2f}, "
-                        f"{player.pred_passing_tds:.2f}"
+
+                    rushing_tds = getattr(player, "pred_rushing_tds", 0.0)
+                    if pd.isna(rushing_tds):
+                        rushing_tds = 0.0
+
+                    display_touchdowns = player.pred_touchdowns
+                    if pd.isna(display_touchdowns):
+                        display_touchdowns = 0.0
+
+                    if player.position == "QB":
+                        display_touchdowns = rushing_tds
+
+                    rows.append(
+                        [
+                            name,
+                            player.position,
+                            f"{player.pred_passing_yards:.2f}",
+                            f"{player.pred_rushing_yards:.2f}",
+                            f"{player.pred_receiving_yards:.2f}",
+                            f"{player.pred_receptions:.2f}",
+                            f"{display_touchdowns:.2f}",
+                            f"{player.pred_passing_tds:.2f}",
+                        ]
+                    )
+
+                if rows:
+                    lines.append("")
+                    lines.append(f"{team} Starters")
+                    lines.extend(
+                        _format_table(
+                            [
+                                "Player",
+                                "Pos",
+                                "Pass Yds",
+                                "Rush Yds",
+                                "Rec Yds",
+                                "Receptions",
+                                "Rush TDs",
+                                "Pass TDs",
+                            ],
+                            rows,
+                            aligns=[
+                                "left",
+                                "center",
+                                "right",
+                                "right",
+                                "right",
+                                "right",
+                                "right",
+                                "right",
+                            ],
+                        )
                     )
 
     report_text = "\n".join(lines)
