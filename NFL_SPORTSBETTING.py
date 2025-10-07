@@ -4647,6 +4647,8 @@ class ModelTrainer:
             )
             merged.loc[mask_missing, ["depth_rank", "is_starter"]] = fallback.to_numpy()
 
+        candidate_pool = merged.copy()
+
         if respect_lineups and allowed_lineup_keys:
             key_series = pd.Series(
                 list(
@@ -4680,7 +4682,7 @@ class ModelTrainer:
                 len(merged),
             )
 
-            required_counts: Dict[str, int] = {"QB": 1, "RB": 1, "WR": 3, "TE": 1}
+            required_counts: Dict[str, int] = {"QB": 1, "RB": 1, "WR": 2, "TE": 1}
             additions: List[pd.DataFrame] = []
             starter_groups = {
                 key: grp
@@ -4694,7 +4696,7 @@ class ModelTrainer:
                 name_text = name_value if isinstance(name_value, str) else ""
                 return pid_text, name_text
 
-            for key, full_group in merged_before_filter.groupby(["game_id", "team"], sort=False):
+            for key, full_group in candidate_pool.groupby(["game_id", "team"], sort=False):
                 starter_group = starter_groups.get(key)
                 if starter_group is not None:
                     existing_keys: Set[Tuple[str, str]] = {
