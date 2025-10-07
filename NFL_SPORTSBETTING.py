@@ -442,7 +442,7 @@ TARGET_ALLOWED_POSITIONS: Dict[str, set[str]] = {
     "passing_yards": {"QB"},
     "passing_tds": {"QB"},
     "rushing_yards": {"QB", "RB", "HB", "FB"},
-    "rushing_tds": {"RB", "HB", "FB"},
+    "rushing_tds": {"QB", "RB", "HB", "FB"},
     "receiving_yards": {"RB", "HB", "FB", "WR", "TE"},
     "receptions": {"RB", "HB", "FB", "WR", "TE"},
     "receiving_tds": {"RB", "HB", "FB", "WR", "TE"},
@@ -4666,6 +4666,8 @@ class ModelTrainer:
         merged["depth_rank"] = merged["depth_rank"].fillna(9).astype(int)
         merged["is_starter"] = merged["is_starter"].fillna(0).astype(int)
 
+        merged_before_filter = merged.copy()
+
         if respect_lineups:
             before = len(merged)
             merged = merged[
@@ -4677,6 +4679,87 @@ class ModelTrainer:
                 before,
                 len(merged),
             )
+
+            required_counts: Dict[str, int] = {"QB": 1, "RB": 1, "WR": 3, "TE": 1}
+            additions: List[pd.DataFrame] = []
+            starter_groups = {
+                key: grp
+                for key, grp in merged.groupby(["game_id", "team"], sort=False)
+            }
+
+            def _make_key(pid_value: Any, name_value: Any) -> Tuple[str, str]:
+                pid_text = str(pid_value)
+                if pid_text.lower() in {"", "nan", "none"}:
+                    pid_text = ""
+                name_text = name_value if isinstance(name_value, str) else ""
+                return pid_text, name_text
+
+            for key, full_group in merged_before_filter.groupby(["game_id", "team"], sort=False):
+                starter_group = starter_groups.get(key)
+                if starter_group is not None:
+                    existing_keys: Set[Tuple[str, str]] = {
+                        _make_key(pid, name)
+                        for pid, name in zip(
+                            starter_group["player_id"],
+                            starter_group["__pname_key"],
+                        )
+                    }
+                    position_counts = starter_group["position"].value_counts().to_dict()
+                else:
+                    existing_keys = set()
+                    position_counts = {}
+
+                full_group = full_group.copy()
+                full_group["__fallback_key"] = [
+                    _make_key(pid, name)
+                    for pid, name in zip(
+                        full_group["player_id"],
+                        full_group["__pname_key"],
+                    )
+                ]
+
+                for pos, needed in required_counts.items():
+                    have = position_counts.get(pos, 0)
+                    if have >= needed:
+                        continue
+
+                    candidates = full_group[full_group["position"] == pos]
+                    if candidates.empty:
+                        continue
+
+                    remaining = needed - have
+                    candidates = candidates[~candidates["__fallback_key"].isin(existing_keys)]
+                    if candidates.empty:
+                        continue
+
+                    candidates = candidates.sort_values(["depth_rank", "player_name"])
+                    selected = candidates.head(remaining)
+                    if selected.empty:
+                        continue
+
+                    selected_keys: List[Tuple[str, str]] = [
+                        _make_key(pid, name)
+                        for pid, name in zip(
+                            selected["player_id"],
+                            selected["__pname_key"],
+                        )
+                    ]
+
+                    additions.append(selected.drop(columns=["__fallback_key"], errors="ignore"))
+                    existing_keys.update(selected_keys)
+                    have += len(selected)
+                    position_counts[pos] = have
+
+                    logging.debug(
+                        "Roster fallback promoted %d %s player(s) for game %s team %s",
+                        len(selected_keys),
+                        pos,
+                        key[0],
+                        key[1],
+                    )
+
+            if additions:
+                merged = pd.concat([merged] + additions, ignore_index=True, sort=False)
 
         return merged.drop(columns=["__pname_key"])
 
@@ -5781,7 +5864,6 @@ def predict_upcoming_games(
             "pred_receiving_yards",
             "pred_receptions",
             "pred_receiving_tds",
-            "pred_rushing_tds",
         ]] = 0.0
 
         # Rushing output is meaningful for quarterbacks and running backs.
