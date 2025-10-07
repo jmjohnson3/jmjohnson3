@@ -27,7 +27,7 @@ import time
 import unicodedata
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -4514,6 +4514,7 @@ class ModelTrainer:
 
         game_ids = sorted(set(map(str, player_df["game_id"].astype(str).tolist())))
         roster_frames: List[pd.DataFrame] = []
+        allowed_lineup_keys: Set[Tuple[str, str, str]] = set()
 
         if lineup_df is not None and not lineup_df.empty:
             lineup_roster = lineup_df.copy()
@@ -4526,6 +4527,10 @@ class ModelTrainer:
             if not lineup_roster.empty:
                 lineup_roster["player_id"] = lineup_roster["player_id"].fillna("").astype(str)
                 lineup_roster["player_name"] = lineup_roster["player_name"].fillna("")
+                lineup_roster["__pname_key"] = lineup_roster["player_name"].map(
+                    normalize_player_name
+                )
+                lineup_roster = lineup_roster[lineup_roster["__pname_key"] != ""].copy()
                 lineup_roster["depth_rank"] = lineup_roster["rank"].apply(parse_depth_rank)
                 lineup_roster["depth_rank"] = lineup_roster["depth_rank"].apply(
                     lambda val: int(val) if pd.notna(val) else None
@@ -4537,6 +4542,26 @@ class ModelTrainer:
                     axis=1,
                 )
                 lineup_roster["source"] = "msf-lineup"
+                if respect_lineups:
+                    allowed_lineup_keys = {
+                        (gid, team, name)
+                        for gid, team, name, starter in zip(
+                            lineup_roster["game_id"],
+                            lineup_roster["team"],
+                            lineup_roster["__pname_key"],
+                            lineup_roster["is_starter"],
+                        )
+                        if starter == 1
+                    }
+                else:
+                    allowed_lineup_keys = set(
+                        zip(
+                            lineup_roster["game_id"],
+                            lineup_roster["team"],
+                            lineup_roster["__pname_key"],
+                        )
+                    )
+                lineup_roster = lineup_roster.drop(columns=["__pname_key"], errors="ignore")
                 needed_cols = [
                     "game_id",
                     "team",
@@ -4621,6 +4646,22 @@ class ModelTrainer:
                 )[["depth_rank", "is_starter"]]
             )
             merged.loc[mask_missing, ["depth_rank", "is_starter"]] = fallback.to_numpy()
+
+        if respect_lineups and allowed_lineup_keys:
+            key_series = pd.Series(
+                list(
+                    zip(
+                        merged["game_id"].astype(str),
+                        merged["team"],
+                        merged["__pname_key"],
+                    )
+                ),
+                index=merged.index,
+            )
+            allowed_mask = key_series.isin(allowed_lineup_keys) | merged["position"].isin(
+                ["K", "DEF"]
+            )
+            merged = merged[allowed_mask]
 
         merged["depth_rank"] = merged["depth_rank"].fillna(9).astype(int)
         merged["is_starter"] = merged["is_starter"].fillna(0).astype(int)
