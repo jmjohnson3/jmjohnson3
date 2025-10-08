@@ -3423,22 +3423,20 @@ class FeatureBuilder:
             return ts < lineup_stale_cutoff
 
         latest_players = (
-            self.player_feature_frame.sort_values("start_time")
-            .groupby("player_id", as_index=False)
+            base_players.sort_values("start_time")
+            .groupby("player_key", as_index=False)
             .tail(1)
         )
-        latest_players["team"] = latest_players["team"].apply(normalize_team_abbr)
-        latest_players = latest_players[latest_players["team"].notna()]
+
+        latest_players = latest_players.drop(columns=["player_key"], errors="ignore")
+
         if "position" in latest_players.columns:
             latest_players["position"] = latest_players["position"].apply(
                 normalize_position
             )
 
-        season_source = self.player_feature_frame.copy()
-        season_source["team"] = season_source["team"].apply(normalize_team_abbr)
+        season_source = base_players.drop(columns=["player_key"], errors="ignore").copy()
         season_source = season_source[season_source["team"].isin(TEAM_ABBR_CANONICAL.keys())]
-        if "position" in season_source.columns:
-            season_source["position"] = season_source["position"].apply(normalize_position)
 
         if not season_source.empty:
             aggregate_candidates = [
