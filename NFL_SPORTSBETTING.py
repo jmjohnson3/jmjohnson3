@@ -3395,23 +3395,55 @@ class FeatureBuilder:
             "TE": {"TE"},
         }
 
+        base_players = self.player_feature_frame.copy()
+        base_players["team"] = base_players["team"].apply(normalize_team_abbr)
+        base_players = base_players[base_players["team"].notna()]
+        base_players["player_id"] = base_players["player_id"].fillna("").astype(str)
+        base_players["player_name_norm"] = base_players["player_name"].fillna("").map(
+            normalize_player_name
+        )
+        if "position" in base_players.columns:
+            base_players["position"] = base_players["position"].apply(normalize_position)
+
+        # Many feeds omit a persistent player identifier, which previously caused rows from
+        # unrelated players to collapse together when we simply grouped on ``player_id``.
+        # Build a stable key that uses the provider id when available and otherwise falls
+        # back to a combination of normalized name and team so each player-season retains a
+        # unique row.
+        base_players["player_key"] = base_players["player_id"].str.strip()
+        missing_key = base_players["player_key"] == ""
+        if missing_key.any():
+            fallback_name = base_players.loc[missing_key, "player_name_norm"]
+            fallback_name = fallback_name.where(
+                fallback_name != "",
+                base_players.loc[missing_key, "player_name"].fillna("").str.strip().str.lower(),
+            )
+            base_players.loc[missing_key, "player_key"] = (
+                fallback_name.fillna("unknown")
+                + "_"
+                + base_players.loc[missing_key, "team"].fillna("")
+            )
+            still_missing = base_players["player_key"].str.strip() == ""
+            if still_missing.any():
+                base_players.loc[still_missing, "player_key"] = [
+                    f"unknown_{idx}" for idx in base_players.index[still_missing]
+                ]
+
         latest_players = (
-            self.player_feature_frame.sort_values("start_time")
-            .groupby("player_id", as_index=False)
+            base_players.sort_values("start_time")
+            .groupby("player_key", as_index=False)
             .tail(1)
         )
-        latest_players["team"] = latest_players["team"].apply(normalize_team_abbr)
-        latest_players = latest_players[latest_players["team"].notna()]
+
+        latest_players = latest_players.drop(columns=["player_key"], errors="ignore")
+
         if "position" in latest_players.columns:
             latest_players["position"] = latest_players["position"].apply(
                 normalize_position
             )
 
-        season_source = self.player_feature_frame.copy()
-        season_source["team"] = season_source["team"].apply(normalize_team_abbr)
+        season_source = base_players.drop(columns=["player_key"], errors="ignore").copy()
         season_source = season_source[season_source["team"].isin(TEAM_ABBR_CANONICAL.keys())]
-        if "position" in season_source.columns:
-            season_source["position"] = season_source["position"].apply(normalize_position)
 
         if not season_source.empty:
             aggregate_candidates = [
