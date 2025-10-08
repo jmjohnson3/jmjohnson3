@@ -903,14 +903,23 @@ def _build_msf_lineup_url(
 def _http_get_with_retry(
     url: str,
     auth: HTTPBasicAuth,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
     max_tries: int = 3,
     backoff: float = 0.8,
 ) -> Optional[requests.Response]:
     last_exc: Optional[Exception] = None
     for attempt in range(max_tries):
         try:
-            response = requests.get(url, auth=auth, timeout=15)
-            if response.status_code == 200:
+            response = requests.get(
+                url,
+                auth=auth,
+                params=params,
+                headers=headers,
+                timeout=15,
+            )
+            if response.status_code in {200, 204}:
                 return response
             if response.status_code == 404:
                 time.sleep(backoff)
@@ -2170,106 +2179,165 @@ class NFLIngestor:
             return []
 
         local_date = _home_local_game_date(start_dt, home_norm)
-        date_key = f"{local_date.year:04d}{local_date.month:02d}{local_date.day:02d}"
-        cache_key = (date_key, away_norm, home_norm)
-        if cache_key in lineup_cache:
-            return lineup_cache[cache_key]
+        utc_date = start_dt.astimezone(dt.timezone.utc).date()
+
+        season_slug = _nfl_season_slug_for_start(start_dt)
+        if not season_slug:
+            logging.info("lineup: unable to determine season slug for %s", start_dt)
+            return []
+
+        date_candidates: List[str] = []
+        local_key = f"{local_date.year:04d}{local_date.month:02d}{local_date.day:02d}"
+        date_candidates.append(local_key)
+        utc_key = f"{utc_date.year:04d}{utc_date.month:02d}{utc_date.day:02d}"
+        if utc_key not in date_candidates:
+            date_candidates.append(utc_key)
 
         if not msf_creds or not msf_creds.api_key:
             logging.warning("lineup: missing MySportsFeeds credentials; skipping fetch")
-            lineup_cache[cache_key] = []
             return []
-
-        url = _build_msf_lineup_url(start_dt, away_norm, home_norm)
-        if not url:
-            logging.info("lineup: could not build msf url (start=%s)", start_dt)
-            lineup_cache[cache_key] = []
-            return []
-
-        logging.debug(
-            "lineup: building URL (UTC=%s, HOME_LOCAL=%s %s @ %s) -> %s",
-            start_dt,
-            local_date,
-            away_norm,
-            home_norm,
-            url,
-        )
-
         auth = HTTPBasicAuth(msf_creds.api_key, msf_creds.password or "MYSPORTSFEEDS")
-        response = _http_get_with_retry(url, auth)
-        if response is None:
-            logging.info("lineup: HTTP failed for %s", url)
-            lineup_cache[cache_key] = []
-            return []
+        accept_headers = {"Accept": "application/json"}
 
-        if response.status_code == 404:
-            logging.info(
-                "lineup: 404 not found for %s (season slug or date/abbr mismatch)",
-                url,
+        last_payload: Optional[Dict[str, Any]] = None
+
+        for date_key in date_candidates:
+            for lineup_type in (None, "expected"):
+                cache_token = f"{date_key}|{lineup_type or 'default'}"
+                cache_key = (cache_token, away_norm, home_norm)
+                if cache_key in lineup_cache:
+                    cached = lineup_cache[cache_key]
+                    if cached:
+                        return cached
+                    continue
+
+                url = (
+                    f"https://api.mysportsfeeds.com/v2.1/pull/nfl/{season_slug}/games/"
+                    f"{date_key}-{away_norm}-{home_norm}/lineup.json"
+                )
+
+                params = {"lineupType": lineup_type} if lineup_type else None
+                response = _http_get_with_retry(
+                    url,
+                    auth,
+                    params=params,
+                    headers=accept_headers,
+                )
+
+                if response is None:
+                    logging.info("lineup: HTTP failed for %s", url)
+                    lineup_cache[cache_key] = []
+                    continue
+
+                if response.status_code == 404:
+                    logging.info(
+                        "lineup: 404 not found for %s (season slug or date/abbr mismatch)",
+                        url,
+                    )
+                    lineup_cache[cache_key] = []
+                    continue
+
+                if response.status_code == 401:
+                    logging.warning(
+                        "lineup: 401 unauthorized for %s (check MSF credentials)",
+                        url,
+                    )
+                    lineup_cache[cache_key] = []
+                    return []
+
+                if response.status_code == 204:
+                    logging.info(
+                        "lineup: 204 empty response for %s (type=%s)",
+                        url,
+                        lineup_type or "actual",
+                    )
+                    lineup_cache[cache_key] = []
+                    continue
+
+                if response.status_code != 200:
+                    logging.warning(
+                        "lineup: %s returned %s",
+                        url,
+                        response.status_code,
+                    )
+                    lineup_cache[cache_key] = []
+                    continue
+
+                try:
+                    payload = response.json()
+                except Exception:
+                    logging.exception("lineup: JSON decode failed for %s", url)
+                    lineup_cache[cache_key] = []
+                    continue
+
+                last_payload = payload if isinstance(payload, dict) else None
+                last_updated = (
+                    parse_dt(payload.get("lastUpdatedOn"))
+                    if isinstance(payload, dict)
+                    else None
+                )
+                rows = _extract_lineup_rows(payload if isinstance(payload, dict) else {})
+
+                if not rows:
+                    team_blocks = (
+                        payload.get("teamLineups")
+                        if isinstance(payload, dict)
+                        else None
+                    ) or []
+                    details: List[str] = []
+                    for block in team_blocks:
+                        team_label = (block.get("team") or {}).get("abbreviation")
+                        actual = (block.get("actual") or {}).get("lineupPositions") or []
+                        expected = (block.get("expected") or {}).get("lineupPositions") or []
+                        details.append(
+                            f"{team_label}: actual={len(actual)} expected={len(expected)}"
+                        )
+                    logging.info(
+                        "lineup: empty lineupPositions for %s; %s",
+                        url,
+                        "; ".join(details) if details else "no teamLineups",
+                    )
+
+                enriched_rows: List[Dict[str, Any]] = []
+                for record in rows:
+                    team = record.get("team")
+                    position = record.get("position")
+                    if not team or not position:
+                        continue
+                    player_name = record.get("player_name") or ""
+                    player_id = record.get("player_id") or ""
+                    player_key = normalize_player_name(player_name)
+                    depth_id = (
+                        f"msf-lineup:{team}:{position}:{player_id}"
+                        if player_id
+                        else f"msf-lineup:{team}:{position}:{player_key}"
+                    )
+                    enriched_rows.append(
+                        {
+                            "team": team,
+                            "position": position,
+                            "player_id": player_id,
+                            "player_name": player_name,
+                            "rank": record.get("rank"),
+                            "depth_id": depth_id,
+                            "updated_at": last_updated,
+                            "source": "msf-lineup",
+                        }
+                    )
+
+                lineup_cache[cache_key] = enriched_rows
+                if enriched_rows:
+                    return enriched_rows
+
+        if last_payload is not None:
+            logging.debug(
+                "lineup: no usable rows after attempts for %s @ %s (payload timestamp=%s)",
+                away_norm,
+                home_norm,
+                last_payload.get("lastUpdatedOn") if isinstance(last_payload, dict) else None,
             )
-            lineup_cache[cache_key] = []
-            return []
-        if response.status_code == 401:
-            logging.warning("lineup: 401 unauthorized for %s (check MSF credentials)", url)
-            lineup_cache[cache_key] = []
-            return []
-        if response.status_code != 200:
-            logging.warning("lineup: %s returned %s", url, response.status_code)
-            lineup_cache[cache_key] = []
-            return []
 
-        try:
-            payload = response.json()
-        except Exception:
-            logging.exception("lineup: JSON decode failed for %s", url)
-            lineup_cache[cache_key] = []
-            return []
-
-        last_updated = parse_dt(payload.get("lastUpdatedOn")) if isinstance(payload, dict) else None
-        rows = _extract_lineup_rows(payload if isinstance(payload, dict) else {})
-        if not rows:
-            team_blocks = (payload.get("teamLineups") if isinstance(payload, dict) else None) or []
-            details: List[str] = []
-            for block in team_blocks:
-                team_label = (block.get("team") or {}).get("abbreviation")
-                actual = (block.get("actual") or {}).get("lineupPositions") or []
-                expected = (block.get("expected") or {}).get("lineupPositions") or []
-                details.append(f"{team_label}: actual={len(actual)} expected={len(expected)}")
-            logging.info(
-                "lineup: empty lineupPositions for %s; %s",
-                url,
-                "; ".join(details) if details else "no teamLineups",
-            )
-
-        enriched_rows: List[Dict[str, Any]] = []
-        for record in rows:
-            team = record.get("team")
-            position = record.get("position")
-            if not team or not position:
-                continue
-            player_name = record.get("player_name") or ""
-            player_id = record.get("player_id") or ""
-            player_key = normalize_player_name(player_name)
-            depth_id = (
-                f"msf-lineup:{team}:{position}:{player_id}"
-                if player_id
-                else f"msf-lineup:{team}:{position}:{player_key}"
-            )
-            enriched_rows.append(
-                {
-                    "team": team,
-                    "position": position,
-                    "player_id": player_id,
-                    "player_name": player_name,
-                    "rank": record.get("rank"),
-                    "depth_id": depth_id,
-                    "updated_at": last_updated,
-                    "source": "msf-lineup",
-                }
-            )
-
-        lineup_cache[cache_key] = enriched_rows
-        return enriched_rows
+        return []
 
     def _skill_pos(self, pos: str) -> bool:
         return normalize_position(pos) in {"QB", "RB", "WR", "TE"}
