@@ -3381,9 +3381,13 @@ class FeatureBuilder:
         starters_per_position: Optional[Dict[str, int]] = None,
         lineup_rows: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
+        base_players = self.player_feature_frame
+
+        if base_players is None:
+            return pd.DataFrame()
+
         if (
-            self.player_feature_frame is None
-            or self.player_feature_frame.empty
+            base_players.empty
             or upcoming_games.empty
         ):
             return pd.DataFrame()
@@ -3422,9 +3426,11 @@ class FeatureBuilder:
                 return True
             return ts < lineup_stale_cutoff
 
+        base_players = base_players.copy()
+
         latest_players = (
             base_players.sort_values("start_time")
-            .groupby("player_key", as_index=False)
+            .groupby("player_id", as_index=False)
             .tail(1)
         )
 
@@ -3435,7 +3441,8 @@ class FeatureBuilder:
                 normalize_position
             )
 
-        season_source = base_players.drop(columns=["player_key"], errors="ignore").copy()
+        season_source = base_players.copy()
+        season_source["team"] = season_source["team"].apply(normalize_team_abbr)
         season_source = season_source[season_source["team"].isin(TEAM_ABBR_CANONICAL.keys())]
 
         if not season_source.empty:
