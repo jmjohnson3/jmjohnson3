@@ -449,6 +449,9 @@ TARGET_ALLOWED_POSITIONS: Dict[str, set[str]] = {
 }
 
 
+LINEUP_STALENESS_DAYS = 45
+
+
 def normalize_player_name(value: Any) -> str:
     """Return a lowercase, punctuation-free representation of a player's name."""
 
@@ -3395,39 +3398,29 @@ class FeatureBuilder:
             "TE": {"TE"},
         }
 
-        base_players = self.player_feature_frame.copy()
-        base_players["team"] = base_players["team"].apply(normalize_team_abbr)
-        base_players = base_players[base_players["team"].notna()]
-        base_players["player_id"] = base_players["player_id"].fillna("").astype(str)
-        base_players["player_name_norm"] = base_players["player_name"].fillna("").map(
-            normalize_player_name
-        )
-        if "position" in base_players.columns:
-            base_players["position"] = base_players["position"].apply(normalize_position)
+        now_utc = default_now_utc()
+        lineup_stale_cutoff = now_utc - dt.timedelta(days=LINEUP_STALENESS_DAYS)
 
-        # Many feeds omit a persistent player identifier, which previously caused rows from
-        # unrelated players to collapse together when we simply grouped on ``player_id``.
-        # Build a stable key that uses the provider id when available and otherwise falls
-        # back to a combination of normalized name and team so each player-season retains a
-        # unique row.
-        base_players["player_key"] = base_players["player_id"].str.strip()
-        missing_key = base_players["player_key"] == ""
-        if missing_key.any():
-            fallback_name = base_players.loc[missing_key, "player_name_norm"]
-            fallback_name = fallback_name.where(
-                fallback_name != "",
-                base_players.loc[missing_key, "player_name"].fillna("").str.strip().str.lower(),
-            )
-            base_players.loc[missing_key, "player_key"] = (
-                fallback_name.fillna("unknown")
-                + "_"
-                + base_players.loc[missing_key, "team"].fillna("")
-            )
-            still_missing = base_players["player_key"].str.strip() == ""
-            if still_missing.any():
-                base_players.loc[still_missing, "player_key"] = [
-                    f"unknown_{idx}" for idx in base_players.index[still_missing]
-                ]
+        def _to_utc_timestamp(value: Any) -> Optional[dt.datetime]:
+            if value is None or (isinstance(value, float) and math.isnan(value)):
+                return None
+            if isinstance(value, pd.Timestamp):
+                if pd.isna(value):
+                    return None
+                if value.tzinfo is None:
+                    return value.tz_localize("UTC").to_pydatetime()
+                return value.tz_convert("UTC").to_pydatetime()
+            if isinstance(value, dt.datetime):
+                if value.tzinfo is None:
+                    return value.replace(tzinfo=dt.timezone.utc)
+                return value.astimezone(dt.timezone.utc)
+            return None
+
+        def _is_stale_lineup_entry(timestamp: Any) -> bool:
+            ts = _to_utc_timestamp(timestamp)
+            if ts is None:
+                return True
+            return ts < lineup_stale_cutoff
 
         latest_players = (
             base_players.sort_values("start_time")
@@ -3585,6 +3578,21 @@ class FeatureBuilder:
                     depth_latest = pd.concat(frames, ignore_index=True, sort=False)
 
         if not depth_latest.empty:
+            lineup_entry_mask = depth_latest.get("_lineup_entry")
+            if lineup_entry_mask is not None:
+                lineup_entry_mask = lineup_entry_mask.fillna(False).astype(bool)
+                if lineup_entry_mask.any():
+                    stale_mask = lineup_entry_mask & depth_latest["updated_at"].apply(
+                        _is_stale_lineup_entry
+                    )
+                    if stale_mask.any():
+                        logging.debug(
+                            "Discarding %d stale lineup entries older than %d days",
+                            int(stale_mask.sum()),
+                            LINEUP_STALENESS_DAYS,
+                        )
+                        depth_latest = depth_latest.loc[~stale_mask].copy()
+
             depth_latest = depth_latest.sort_values(
                 ["_lineup_entry", "updated_at"], ascending=[True, True]
             )
@@ -3622,6 +3630,11 @@ class FeatureBuilder:
             for depth_row in depth_latest.itertuples():
                 key = (depth_row.team, depth_row.player_name_norm)
                 if key in existing_keys:
+                    continue
+
+                if getattr(depth_row, "_lineup_entry", False) and _is_stale_lineup_entry(
+                    getattr(depth_row, "updated_at", None)
+                ):
                     continue
 
                 placeholder: Dict[str, Any] = {
