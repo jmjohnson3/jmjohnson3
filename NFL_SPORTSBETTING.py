@@ -680,20 +680,20 @@ def ensure_lineup_players_in_latest(
 
     additions: List[Dict[str, Any]] = []
 
-    for lineup_row in lineup.itertuples():
-        team = getattr(lineup_row, "team")
-        base_pos = getattr(lineup_row, "base_pos")
-        pname_key = getattr(lineup_row, "__pname_key")
+    for _, lineup_row in lineup.iterrows():
+        team = lineup_row.get("team")
+        base_pos = lineup_row.get("base_pos")
+        pname_key = lineup_row.get("__pname_key")
         if not team or not base_pos or not pname_key:
             continue
         key = (team, base_pos, pname_key)
         if key in existing_keys:
             continue
 
-        player_name = getattr(lineup_row, "player_name", "") or ""
+        player_name = lineup_row.get("player_name") or ""
         if not player_name:
-            first = getattr(lineup_row, "first_name", "")
-            last = getattr(lineup_row, "last_name", "")
+            first = lineup_row.get("first_name", "")
+            last = lineup_row.get("last_name", "")
             player_name = " ".join(part for part in [first, last] if part)
 
         placeholder = {col: np.nan for col in template_columns}
@@ -703,16 +703,16 @@ def ensure_lineup_players_in_latest(
         placeholder["player_name_norm"] = normalize_player_name(player_name)
         placeholder["__pname_key"] = pname_key
 
-        raw_player_id = getattr(lineup_row, "player_id", None)
+        raw_player_id = lineup_row.get("player_id")
         if isinstance(raw_player_id, str) and raw_player_id:
             placeholder["player_id"] = raw_player_id
         else:
             placeholder["player_id"] = f"lineup_{team}_{pname_key}"
 
-        depth_rank = getattr(lineup_row, "rank", None)
+        depth_rank = lineup_row.get("rank")
         placeholder["depth_rank"] = depth_rank if depth_rank not in (None, "") else 1
 
-        playing_prob = str(getattr(lineup_row, "playing_probability", "") or "").lower()
+        playing_prob = str(lineup_row.get("playing_probability", "") or "").lower()
         status_bucket = "questionable" if playing_prob == "questionable" else "other"
         placeholder["status_bucket"] = status_bucket
         placeholder["practice_status"] = "available"
@@ -726,17 +726,17 @@ def ensure_lineup_players_in_latest(
         if "source" in placeholder:
             placeholder["source"] = "msf-lineup"
 
-        updated_at = getattr(lineup_row, "updated_at", None)
-        game_start = getattr(lineup_row, "game_start", None)
+        updated_at = lineup_row.get("updated_at")
+        game_start = lineup_row.get("game_start")
         if "updated_at" in placeholder:
             placeholder["updated_at"] = updated_at
         if "game_start" in placeholder:
             placeholder["game_start"] = game_start
 
         if "first_name" in placeholder:
-            placeholder["first_name"] = getattr(lineup_row, "first_name", "")
+            placeholder["first_name"] = lineup_row.get("first_name", "")
         if "last_name" in placeholder:
-            placeholder["last_name"] = getattr(lineup_row, "last_name", "")
+            placeholder["last_name"] = lineup_row.get("last_name", "")
 
         for col, default_val in feature_defaults.items():
             if col in placeholder:
