@@ -449,7 +449,8 @@ TARGET_ALLOWED_POSITIONS: Dict[str, set[str]] = {
 }
 
 
-LINEUP_STALENESS_DAYS = 45
+LINEUP_STALENESS_DAYS = 7
+LINEUP_MAX_AGE_BEFORE_GAME_DAYS = 21  # allow expected lineups up to 3 weeks old relative to kickoff
 
 
 def normalize_player_name(value: Any) -> str:
@@ -962,6 +963,10 @@ def _extract_lineup_rows(json_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
             if base_pos is None:
                 continue
             player_info = position_entry.get("player") or {}
+            current_team_info = player_info.get("currentTeam") or player_info.get("team") or {}
+            current_team = normalize_team_abbr(
+                current_team_info.get("abbreviation") or current_team_info.get("name")
+            )
             first = (player_info.get("firstName") or "").strip()
             last = (player_info.get("lastName") or "").strip()
             display = (player_info.get("displayName") or "").strip()
@@ -976,6 +981,7 @@ def _extract_lineup_rows(json_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "player_name": name,
                     "position": base_pos,
                     "rank": rank,
+                    "player_current_team": current_team,
                     "source_section": section_label,
                 }
             )
@@ -2280,6 +2286,17 @@ class NFLIngestor:
                     else None
                 )
                 rows = _extract_lineup_rows(payload if isinstance(payload, dict) else {})
+                references = (
+                    (payload.get("references") or {}).get("playerReferences")
+                    if isinstance(payload, dict)
+                    else None
+                ) or []
+                player_refs: Dict[str, Dict[str, Any]] = {}
+                for pref in references:
+                    pid = pref.get("id")
+                    if pid in (None, ""):
+                        continue
+                    player_refs[str(pid)] = pref
 
                 if not rows:
                     team_blocks = (
@@ -2315,6 +2332,14 @@ class NFLIngestor:
                         if player_id
                         else f"msf-lineup:{team}:{position}:{player_key}"
                     )
+                    player_ref = player_refs.get(player_id) if player_id else None
+                    ref_team = None
+                    if isinstance(player_ref, dict):
+                        ref_team_info = player_ref.get("currentTeam") or player_ref.get("team") or {}
+                        ref_team = normalize_team_abbr(
+                            ref_team_info.get("abbreviation") or ref_team_info.get("name")
+                        )
+                    current_team = record.get("player_current_team") or ref_team
                     enriched_rows.append(
                         {
                             "team": team,
@@ -2325,6 +2350,7 @@ class NFLIngestor:
                             "depth_id": depth_id,
                             "updated_at": last_updated,
                             "source": "msf-lineup",
+                            "player_current_team": current_team,
                         }
                     )
 
@@ -2388,6 +2414,13 @@ class NFLIngestor:
                 pos = normalize_position(entry.get("position"))
                 if not self._skill_pos(pos):
                     continue
+                current_team_entry = normalize_team_abbr(entry.get("player_current_team"))
+                if (
+                    pos in {"QB", "RB", "WR", "TE"}
+                    and current_team_entry
+                    and current_team_entry != team_normalized
+                ):
+                    continue
                 pid = (entry.get("player_id") or "").strip()
                 pname = (entry.get("player_name") or "").strip()
                 if not pname and not pid:
@@ -2435,6 +2468,7 @@ class NFLIngestor:
                         else 0,
                         "source": info.get("source", "msf-lineup"),
                         "updated_at": updated_at_dt,
+                        "game_start": start_time,
                     }
                 )
         return rows
@@ -3402,29 +3436,29 @@ class FeatureBuilder:
             "TE": {"TE"},
         }
 
-        now_utc = default_now_utc()
-        lineup_stale_cutoff = now_utc - dt.timedelta(days=LINEUP_STALENESS_DAYS)
+        _stale_reference_now = pd.Timestamp.utcnow()
 
-        def _to_utc_timestamp(value: Any) -> Optional[dt.datetime]:
-            if value is None or (isinstance(value, float) and math.isnan(value)):
-                return None
-            if isinstance(value, pd.Timestamp):
-                if pd.isna(value):
-                    return None
-                if value.tzinfo is None:
-                    return value.tz_localize("UTC").to_pydatetime()
-                return value.tz_convert("UTC").to_pydatetime()
-            if isinstance(value, dt.datetime):
-                if value.tzinfo is None:
-                    return value.replace(tzinfo=dt.timezone.utc)
-                return value.astimezone(dt.timezone.utc)
-            return None
+        def _is_stale_lineup_entry(row: pd.Series, now: Optional[pd.Timestamp] = None) -> bool:
+            """Determine whether a lineup row is stale relative to kickoff."""
 
-        def _is_stale_lineup_entry(timestamp: Any) -> bool:
-            ts = _to_utc_timestamp(timestamp)
-            if ts is None:
-                return True
-            return ts < lineup_stale_cutoff
+            now_ts = (
+                _stale_reference_now
+                if now is None
+                else pd.to_datetime(now, utc=True, errors="coerce")
+            )
+            updated_at = pd.to_datetime(row.get("updated_at"), utc=True, errors="coerce")
+            if pd.isna(updated_at):
+                return False
+
+            game_start = pd.to_datetime(row.get("game_start"), utc=True, errors="coerce")
+            if not pd.isna(game_start):
+                return updated_at < (
+                    game_start - pd.Timedelta(days=LINEUP_MAX_AGE_BEFORE_GAME_DAYS)
+                )
+
+            if pd.isna(now_ts):
+                now_ts = pd.Timestamp.utcnow()
+            return (now_ts - updated_at) > pd.Timedelta(days=LINEUP_STALENESS_DAYS)
 
         base_players = base_players.copy()
 
@@ -3589,13 +3623,14 @@ class FeatureBuilder:
             if lineup_entry_mask is not None:
                 lineup_entry_mask = lineup_entry_mask.fillna(False).astype(bool)
                 if lineup_entry_mask.any():
-                    stale_mask = lineup_entry_mask & depth_latest["updated_at"].apply(
-                        _is_stale_lineup_entry
+                    stale_mask = lineup_entry_mask & depth_latest.apply(
+                        _is_stale_lineup_entry, axis=1
                     )
                     if stale_mask.any():
                         logging.debug(
-                            "Discarding %d stale lineup entries older than %d days",
+                            "Discarding %d stale lineup entries (>%d days pre-kickoff or >%d days old)",
                             int(stale_mask.sum()),
+                            LINEUP_MAX_AGE_BEFORE_GAME_DAYS,
                             LINEUP_STALENESS_DAYS,
                         )
                         depth_latest = depth_latest.loc[~stale_mask].copy()
@@ -3847,7 +3882,8 @@ class FeatureBuilder:
             latest_players["depth_rank"], errors="coerce"
         )
         if "_lineup_entry" in latest_players.columns:
-            lineup_mask = latest_players["_lineup_entry"].fillna(False).astype(bool)
+            lineup_mask = latest_players["_lineup_entry"].fillna(False)
+            lineup_mask = lineup_mask.infer_objects(copy=False).astype(bool)
             starter_allowance = (
                 latest_players["position"].fillna("").map(starters_per_position).fillna(1)
             )
@@ -4635,6 +4671,7 @@ class ModelTrainer:
         game_ids = sorted(set(map(str, player_df["game_id"].astype(str).tolist())))
         roster_frames: List[pd.DataFrame] = []
         allowed_lineup_keys: Set[Tuple[str, str, str]] = set()
+        lineup_player_keys: Set[Tuple[str, str, str]] = set()
 
         if lineup_df is not None and not lineup_df.empty:
             lineup_roster = lineup_df.copy()
@@ -4663,6 +4700,13 @@ class ModelTrainer:
                 )
                 lineup_roster["source"] = "msf-lineup"
                 if respect_lineups:
+                    lineup_player_keys = set(
+                        zip(
+                            lineup_roster["game_id"],
+                            lineup_roster["team"],
+                            lineup_roster["__pname_key"],
+                        )
+                    )
                     allowed_lineup_keys = {
                         (gid, team, name)
                         for gid, team, name, starter in zip(
@@ -4681,6 +4725,7 @@ class ModelTrainer:
                             lineup_roster["__pname_key"],
                         )
                     )
+                    lineup_player_keys = allowed_lineup_keys.copy()
                 lineup_roster = lineup_roster.drop(columns=["__pname_key"], errors="ignore")
                 needed_cols = [
                     "game_id",
@@ -4769,6 +4814,8 @@ class ModelTrainer:
 
         candidate_pool = merged.copy()
 
+        candidate_limit_keys = lineup_player_keys or allowed_lineup_keys
+
         if respect_lineups and allowed_lineup_keys:
             key_series = pd.Series(
                 list(
@@ -4784,6 +4831,19 @@ class ModelTrainer:
                 ["K", "DEF"]
             )
             merged = merged[allowed_mask]
+            if candidate_limit_keys and not candidate_pool.empty:
+                candidate_keys = candidate_pool.apply(
+                    lambda r: (
+                        str(r.get("game_id")),
+                        r.get("team"),
+                        r.get("__pname_key"),
+                    ),
+                    axis=1,
+                )
+                cand_allowed_mask = candidate_keys.isin(candidate_limit_keys) | candidate_pool["position"].isin(
+                    {"K", "DEF"}
+                )
+                candidate_pool = candidate_pool[cand_allowed_mask].copy()
 
         merged["depth_rank"] = merged["depth_rank"].fillna(9).astype(int)
         merged["is_starter"] = merged["is_starter"].fillna(0).astype(int)
@@ -4832,6 +4892,10 @@ class ModelTrainer:
                     position_counts = {}
 
                 full_group = full_group.copy()
+                if "status_bucket" in full_group.columns:
+                    full_group = full_group[
+                        ~full_group["status_bucket"].isin(INACTIVE_INJURY_BUCKETS)
+                    ].copy()
                 full_group["__fallback_key"] = [
                     _make_key(pid, name)
                     for pid, name in zip(
@@ -5895,6 +5959,8 @@ def predict_upcoming_games(
                     "rank": row.get("rank"),
                     "updated_at": updated_at,
                     "player_name_norm": player_name_norm,
+                    "game_start": getattr(game, "start_time", None),
+                    "player_current_team": row.get("player_current_team"),
                 }
                 key = (record["game_id"], team, player_name_norm)
                 existing = lineup_records.get(key)
