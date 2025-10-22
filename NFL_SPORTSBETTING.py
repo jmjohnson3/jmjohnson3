@@ -5356,6 +5356,215 @@ class ModelTrainer:
             f"{prefix}subsample": [0.6, 0.8, 1.0],
         }
 
+    def _edge_threshold_for_target(self, target: str, train_df: pd.DataFrame) -> float:
+        """Dynamic edge threshold based on target volatility."""
+
+        std = float(train_df[target].std(ddof=0) or 0.0)
+        if "td" in target:
+            base = 0.05
+        elif "reception" in target:
+            base = 0.2
+        else:
+            base = 0.8
+        threshold = max(base, std * 0.1)
+        return float(threshold)
+
+    def _estimate_prop_lines(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target: str,
+        history_window: int = 5,
+    ) -> np.ndarray:
+        """Approximate closing lines using trailing player and team history."""
+
+        if train_df.empty:
+            return np.full(len(test_df), float("nan"))
+
+        history = train_df.copy()
+        key_column = None
+        for candidate in ("player_id", "entity_id", "player_name"):
+            if candidate in history.columns:
+                key_column = candidate
+                break
+        if key_column is None:
+            key_column = "player_id"
+            history[key_column] = ""
+
+        history[key_column] = history[key_column].fillna("").astype(str)
+        history_team = history.get("team")
+        if history_team is not None:
+            history["team"] = history_team.fillna("").astype(str)
+
+        player_means: Dict[str, float] = (
+            history.groupby(key_column)[target]
+            .apply(lambda s: s.tail(history_window).mean())
+            .dropna()
+            .to_dict()
+        )
+
+        team_means: Dict[str, float] = {}
+        if "team" in history.columns:
+            team_means = (
+                history.groupby("team")[target]
+                .mean()
+                .dropna()
+                .to_dict()
+            )
+
+        global_mean = float(history[target].mean())
+        if math.isnan(global_mean):
+            global_mean = 0.0
+
+        estimates: List[float] = []
+        for row in test_df.itertuples():
+            player_key = str(getattr(row, key_column, "")) if key_column else ""
+            estimate = player_means.get(player_key)
+            if estimate is None or math.isnan(estimate):
+                team_key = getattr(row, "team", None)
+                if team_key is not None:
+                    team_key = str(team_key)
+                if team_key and team_key in team_means:
+                    estimate = team_means.get(team_key)
+            if estimate is None or math.isnan(estimate):
+                estimate = global_mean
+            estimates.append(float(estimate))
+
+        return np.asarray(estimates, dtype=float)
+
+    def _walk_forward_backtest(
+        self,
+        df: pd.DataFrame,
+        feature_columns: Sequence[str],
+        preprocessor: ColumnTransformer,
+        target: str,
+    ) -> Dict[str, Any]:
+        """Walk-forward evaluation with simulated betting ROI."""
+
+        sorted_df = self._sort_by_time(df).reset_index(drop=True)
+        if len(sorted_df) < 25:
+            return {}
+
+        try:
+            cv = self._build_time_series_cv(len(sorted_df))
+        except ValueError:
+            return {}
+
+        predictions: List[pd.Series] = []
+        actuals: List[pd.Series] = []
+        closers: List[pd.Series] = []
+        profits: List[float] = []
+        baseline_errors: List[np.ndarray] = []
+        folds = 0
+
+        for train_idx, test_idx in cv.split(sorted_df):
+            train_df = sorted_df.iloc[train_idx]
+            test_df = sorted_df.iloc[test_idx]
+            if test_df.empty or train_df.empty:
+                continue
+
+            folds += 1
+            fold_model = Pipeline(
+                [
+                    ("preprocessor", clone(preprocessor)),
+                    (
+                        "regressor",
+                        GradientBoostingRegressor(
+                            random_state=42,
+                            learning_rate=0.05,
+                            max_depth=3,
+                            n_estimators=300,
+                        ),
+                    ),
+                ]
+            )
+            fold_model.fit(train_df[feature_columns], train_df[target])
+            fold_pred = fold_model.predict(test_df[feature_columns])
+
+            closing_lines = self._estimate_prop_lines(train_df, test_df, target)
+            predictions.append(pd.Series(fold_pred, index=test_df.index))
+            actuals.append(test_df[target])
+            closers.append(pd.Series(closing_lines, index=test_df.index))
+            baseline_errors.append(np.abs(closing_lines - test_df[target].to_numpy()))
+
+            threshold = self._edge_threshold_for_target(target, train_df)
+            for pred_val, line_val, actual_val in zip(
+                fold_pred, closing_lines, test_df[target].to_numpy()
+            ):
+                if np.isnan(line_val):
+                    continue
+                diff = pred_val - line_val
+                if abs(diff) <= threshold:
+                    continue
+                direction = 1 if diff > 0 else -1
+                outcome = actual_val - line_val
+                if abs(outcome) < 1e-6:
+                    profit = 0.0
+                elif (outcome > 0 and direction > 0) or (outcome < 0 and direction < 0):
+                    profit = 0.9090909091
+                else:
+                    profit = -1.0
+                profits.append(float(profit))
+
+        if not predictions:
+            return {}
+
+        pred_series = pd.concat(predictions).sort_index()
+        actual_series = pd.concat(actuals).sort_index()
+        closer_series = pd.concat(closers).sort_index()
+
+        mae = mean_absolute_error(actual_series, pred_series)
+        rmse = float(np.sqrt(mean_squared_error(actual_series, pred_series)))
+        baseline_mae = (
+            float(np.mean(np.concatenate(baseline_errors))) if baseline_errors else float("nan")
+        )
+        mae_vs_close = baseline_mae - mae if not math.isnan(baseline_mae) else float("nan")
+
+        edge_source = "player_history_mean"
+        if not profits:
+            valid = closer_series.dropna()
+            if not valid.empty:
+                diff = (pred_series.loc[valid.index] - closer_series.loc[valid.index]).abs()
+                top_indices = diff.sort_values(ascending=False).head(min(5, len(diff))).index
+                for idx in top_indices:
+                    pred_val = pred_series.loc[idx]
+                    line_val = closer_series.loc[idx]
+                    actual_val = actual_series.loc[idx]
+                    direction = 1 if pred_val > line_val else -1
+                    outcome = actual_val - line_val
+                    if abs(outcome) < 1e-6:
+                        profit = 0.0
+                    elif (outcome > 0 and direction > 0) or (outcome < 0 and direction < 0):
+                        profit = 0.9090909091
+                    else:
+                        profit = -1.0
+                    profits.append(float(profit))
+                if profits:
+                    edge_source = "player_history_mean_topk"
+
+        if not profits:
+            edge_source = "insufficient_history"
+            profits = [0.0]
+
+        roi = float(np.mean(profits))
+        if len(profits) > 1:
+            roi_ci = float(1.96 * (np.std(profits, ddof=1) / math.sqrt(len(profits))))
+        else:
+            roi_ci = 0.0
+
+        return {
+            "folds": folds,
+            "mae": float(mae),
+            "rmse": float(rmse),
+            "baseline_mae": float(baseline_mae) if not math.isnan(baseline_mae) else float("nan"),
+            "mae_vs_close": float(mae_vs_close) if not math.isnan(mae_vs_close) else float("nan"),
+            "roi": roi,
+            "roi_ci": roi_ci,
+            "bets": len(profits),
+            "edge_source": edge_source,
+            "samples": len(actual_series),
+        }
+
     def train(self) -> Dict[str, Pipeline]:
         datasets = self.feature_builder.build_features()
         models: Dict[str, Pipeline] = {}
@@ -5599,6 +5808,48 @@ class ModelTrainer:
             {"r2": r2, "mae": mae, "rmse": rmse},
             sample_size=len(y_test),
         )
+
+        walk_summary = self._walk_forward_backtest(df, feature_columns, preprocessor, target)
+        if walk_summary:
+            mae_vs_close_val = walk_summary.get("mae_vs_close")
+            mae_vs_close_str = (
+                f"{mae_vs_close_val:+.3f}" if mae_vs_close_val is not None and not math.isnan(mae_vs_close_val) else "n/a"
+            )
+            roi_pct = walk_summary["roi"] * 100.0
+            roi_ci_pct = walk_summary["roi_ci"] * 100.0
+            roi_display = f"{roi_pct:.1f}%"
+            roi_ci_display = f"±{roi_ci_pct:.1f}%"
+            logging.info(
+                "%s walk-forward | folds=%d | MAE=%.3f | RMSE=%.3f | MAE_vs_close=%s | ROI=%s (CI=%s) | bets=%d | edge_source=%s",
+                target,
+                walk_summary["folds"],
+                walk_summary["mae"],
+                walk_summary["rmse"],
+                mae_vs_close_str,
+                roi_display,
+                roi_ci_display,
+                walk_summary["bets"],
+                walk_summary["edge_source"],
+            )
+
+            metrics_payload: Dict[str, float] = {
+                "walk_mae": walk_summary["mae"],
+                "walk_rmse": walk_summary["rmse"],
+                "walk_roi": walk_summary["roi"],
+                "walk_roi_ci": walk_summary["roi_ci"],
+            }
+            baseline_mae_val = walk_summary.get("baseline_mae")
+            if baseline_mae_val is not None and not math.isnan(baseline_mae_val):
+                metrics_payload["walk_baseline_mae"] = baseline_mae_val
+            metrics_payload["walk_bets"] = float(walk_summary["bets"])
+
+            self.db.record_backtest_metrics(
+                self.run_id,
+                f"{target}_walk",
+                metrics_payload,
+                sample_size=walk_summary.get("samples"),
+            )
+
         self.model_uncertainty[target] = {"rmse": rmse, "mae": mae}
 
         ensemble.fit(sorted_df[feature_columns], sorted_df[target])
